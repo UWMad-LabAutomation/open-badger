@@ -1,0 +1,13 @@
+# Ignore local environments, caches, checkpoints, datasets, and experiment outputs.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+checkpoints/
+outputs/
+datasets/
+wandb/
+
