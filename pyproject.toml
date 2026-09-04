@@ -1,3 +1,21 @@
-# Project metadata and dependencies will be added as the implementation begins.
-# Keep package configuration here rather than duplicating it across setup files.
+# Packaging metadata for the Open Badger Python package.
+# Runtime and development dependencies will be added when their implementations
+# are introduced; this first step only makes the source tree installable.
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "open-badger"
+version = "0.1.0"
+description = "Research framework for robot policy training and inference"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
