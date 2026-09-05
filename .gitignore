@@ -11,3 +11,9 @@ outputs/
 datasets/
 wandb/
 
+*.egg-info/
+
+# Ignore generated build artifacts.
+build/
+dist/
+*.whl
