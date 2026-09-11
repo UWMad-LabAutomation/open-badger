@@ -1,2 +1,3 @@
-# Model registration and model-specific integration points.
-# Keep model implementations out of the training and inference entry points.
+from .registry import Model, ModelRegistry
+
+__all__ = ["Model", "ModelRegistry"]
