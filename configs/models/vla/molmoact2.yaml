@@ -1,2 +1,25 @@
-# Placeholder for MolmoAct2 model configuration.
+model:
+  name: molmoact2
+  checkpoint:
+    source: huggingface
+    repo_id: allenai/MolmoAct2
+    revision: null
+    cache_dir: null
+    local_files_only: false
 
+runtime:
+  device: cuda:0
+  requires_grad: false
+  backend: torch
+  dtype: float32
+
+inference:
+  action_mode: continuous
+  norm_tag: null
+  sequence_length: null
+  flow_matching_steps: null
+
+optimization:
+  attention: sdpa
+  torch_compile: false
+  cuda_graphs: false

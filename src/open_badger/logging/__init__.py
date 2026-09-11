@@ -1,2 +1,2 @@
-# Logging backends will be exposed here as they are implemented.
-
+# Logging integrations for training jobs.
+# The implementation lives in logging.py and supports W&B and TensorBoard.

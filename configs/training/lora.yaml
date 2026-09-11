@@ -1,2 +1,58 @@
-# Placeholder for LoRA fine-tuning settings.
+# LoRA fine-tuning configuration for the generic supervised trainer.
+# These are starting values for review, not yet validated MolmoAct2 defaults.
 
+strategy: lora
+
+selection:
+  # Semantic names are resolved by the model adapter. For MolmoAct2, the
+  # action_head maps to the native continuous action expert.
+  lora_components:
+    - vlm
+    - vision_encoder
+    - projector
+  full_finetune_components:
+    - action_head
+  freeze_unspecified: true
+
+lora:
+  enabled: true
+  rank: 64
+  alpha: 16
+  dropout: 0.0
+  bias: none
+  # Leave concrete module names to the model adapter unless explicitly needed.
+  target_modules: null
+
+optimizer:
+  name: adamw
+  learning_rates:
+    vlm: 5.0e-5
+    vision_encoder: 5.0e-5
+    projector: 5.0e-5
+    action_head: 5.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+scheduler:
+  name: cosine
+  warmup_steps: 1000
+  min_lr_ratio: 0.0
+
+training:
+  max_steps: 50000
+  gradient_accumulation_steps: 1
+  gradient_clip_norm: 1.0
+  mixed_precision: null
+  seed: 42
+
+checkpointing:
+  save_every_steps: 1000
+  keep_last_n: 3
+  resume_from: null
+
+validation:
+  every_steps: 500
+
+logging:
+  every_steps: 10

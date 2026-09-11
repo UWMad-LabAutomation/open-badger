@@ -7,6 +7,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
 WORKDIR /workspace/open-badger
 
 # Install only operating-system tools needed for Python development and pulling
@@ -19,6 +22,9 @@ RUN apt-get update \
         python3-pip \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# Keep project packages out of Ubuntu's externally managed system Python.
+RUN python3 -m venv "$VIRTUAL_ENV"
 
 COPY pyproject.toml README.md ./
 COPY src/ ./src/

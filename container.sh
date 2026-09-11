@@ -42,7 +42,8 @@ case "$command" in
 
         docker run --rm -it \
             --name "$CONTAINER_NAME" \
-            --gpus all \
+            --runtime=nvidia \
+            -e NVIDIA_VISIBLE_DEVICES=all \
             --volume "$ROOT_DIR:/workspace/open-badger" \
             --workdir /workspace/open-badger \
             "$IMAGE_NAME" \
