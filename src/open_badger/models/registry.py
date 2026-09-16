@@ -8,7 +8,7 @@ remain responsible for backend-specific orchestration.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -134,6 +134,22 @@ class Model(nn.Module, ABC):
     def unfreeze_parameters(self, exclude: set[str] | None = None) -> None:
         self.freeze_parameters(freeze=False, exclude=exclude)
 
+    @staticmethod
+    def select_history_window(value: Any, *, history_length: int) -> tuple[Any, Any | None]:
+        """Split one example's observation value into (current_frame, full_window).
+
+        Shared across model implementations so frame-stacking is a config toggle
+        rather than a per-model reimplementation. `history_length=1` is the
+        Markovian default: `value` is a single frame and `full_window` is `None`.
+        `history_length>1` expects `value` as a sequence of that many frames
+        ordered oldest-to-newest; the most recent frame is `current_frame`.
+        """
+        if history_length == 1:
+            return value, None
+        if len(value) != history_length:
+            raise ValueError(f"Expected {history_length} stacked frames, got {len(value)}.")
+        return value[-1], value
+
 
 class MolmoAct2(Model):
     """MolmoAct2 vision-language-action policy (allenai/MolmoAct2).
@@ -191,20 +207,30 @@ class MolmoAct2(Model):
         inference_cfg = self.config.get("inference", {}) or {}
         self.norm_tag = inference_cfg.get("norm_tag")
         self.action_mode = inference_cfg.get("action_mode", "continuous")
+        # Expected to already be in the dataset-agnostic naming scheme produced
+        # by the data-loading layer, not raw per-robot camera names.
         self.image_keys = list(inference_cfg.get("image_keys") or [])
         self.n_action_steps = inference_cfg.get("n_action_steps")
         self.num_flow_matching_steps = inference_cfg.get("flow_matching_steps")
         self.action_dim = int(inference_cfg.get("action_dim", 32))
+        self.history_length = int(inference_cfg.get("history_length", 1))
+        if self.history_length < 1:
+            raise ValueError("`inference.history_length` must be >= 1.")
 
-    def preprocess_batch(self, batch: Any) -> Any:
+    def preprocess_batch(self, batch: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Convert a Lerobot2-like batch into per-example MolmoAct2 inputs.
 
         Expects `batch` to provide `task` (instruction strings),
         `observation.state` (robot state vectors), and one
         `observation.images.*` entry per key configured in
         `inference.image_keys` (order matters; it must match the checkpoint's
-        expected camera order). Returns a list of per-example dicts with
-        `images`, `task`, and `state`, ready for `forward()`.
+        expected camera order). When `inference.history_length > 1`, each
+        value is a sequence of that many stacked frames (oldest-to-newest)
+        instead of a single frame. Returns a list of per-example dicts with
+        `images`, `task`, and `state` for the current frame; the
+        `predict_action()` call this feeds is Markovian regardless of
+        `history_length`, but `observation_history` is attached for models/
+        forward paths that consume the full window.
         """
         if not self.image_keys:
             raise ValueError(
@@ -218,14 +244,33 @@ class MolmoAct2(Model):
 
         examples = []
         for idx in range(batch_size):
-            images = [batch[image_key][idx] for image_key in self.image_keys]
-            state = states[idx]
-            if torch.is_tensor(state):
-                state = state.detach().cpu().numpy()
-            examples.append({"images": images, "task": tasks[idx], "state": state})
+            current_images = []
+            image_history: dict[str, Any] = {}
+            for image_key in self.image_keys:
+                current, window = self.select_history_window(
+                    batch[image_key][idx], history_length=self.history_length
+                )
+                current_images.append(current)
+                if window is not None:
+                    image_history[image_key] = window
+
+            current_state, state_history = self.select_history_window(
+                states[idx], history_length=self.history_length
+            )
+            if torch.is_tensor(current_state):
+                current_state = current_state.detach().cpu().numpy()
+
+            example: dict[str, Any] = {
+                "images": current_images,
+                "task": tasks[idx],
+                "state": current_state,
+            }
+            if self.history_length > 1:
+                example["observation_history"] = {"images": image_history, "state": state_history}
+            examples.append(example)
         return examples
 
-    def forward(self, inputs: Any, **kwargs: Any) -> Any:
+    def forward(self, inputs: list[dict[str, Any]], **kwargs: Any) -> torch.Tensor:
         """Run MolmoAct2's continuous flow-matching action head.
 
         `inputs` is the list of per-example dicts produced by

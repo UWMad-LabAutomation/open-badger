@@ -18,12 +18,14 @@ inference:
   norm_tag: null
   sequence_length: null
   flow_matching_steps: null
-  # Ordered observation.images.* keys passed to the MolmoAct2 processor.
+  # Ordered universal observation.images.* keys (renamed from raw dataset
+  # camera names by the data-loading layer), not per-robot names like top/cam0.
   image_keys: []
   n_action_steps: null
-  # MolmoAct2 checkpoints expose absolute joint/encoder position targets in
-  # this many dims for our robot; predict_action() output is sliced to this.
-  action_dim: 32
+  action_dim: 32    # molmoact2 outputs actions and a 32D continuous action space
+  # 1 = Markovian (current frame only). >1 stacks that many past frames per
+  # observation key for benchmarking framestacked vs Markovian policies.
+  history_length: 1
 
 optimization:
   attention: sdpa
