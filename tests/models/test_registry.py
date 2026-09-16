@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from open_badger.models import Model, ModelRegistry
@@ -9,6 +10,9 @@ class DummyModel(Model):
 
     def forward(self, inputs, **kwargs):
         return self.linear(inputs)
+
+    def preprocess_batch(self, batch):
+        return batch
 
     def compute_loss(self, batch, outputs):
         return torch.mean(outputs)
@@ -46,3 +50,15 @@ def test_model_training_step_runs_default_pipeline():
     assert "loss" in result
     assert "outputs" in result
     assert torch.is_tensor(result["loss"])
+
+
+def test_model_requires_preprocess_and_loss_hooks():
+    class IncompleteModel(Model):
+        def build_network(self) -> None:
+            pass
+
+        def forward(self, inputs, **kwargs):
+            return inputs
+
+    with pytest.raises(TypeError):
+        IncompleteModel({"device": "cpu", "dtype": "float32"})

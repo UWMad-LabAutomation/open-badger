@@ -18,6 +18,12 @@ inference:
   norm_tag: null
   sequence_length: null
   flow_matching_steps: null
+  # Ordered observation.images.* keys passed to the MolmoAct2 processor.
+  image_keys: []
+  n_action_steps: null
+  # MolmoAct2 checkpoints expose absolute joint/encoder position targets in
+  # this many dims for our robot; predict_action() output is sliced to this.
+  action_dim: 32
 
 optimization:
   attention: sdpa
