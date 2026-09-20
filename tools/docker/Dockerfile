@@ -10,6 +10,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
+ARG LEROBOT_COMMIT=a4f15bf347dee7eb8a8c5f4a70a37f476b091113
+ENV LEROBOT_ROOT=/opt/lerobot
+
 WORKDIR /workspace/open-badger
 
 # Install only operating-system tools needed for Python development and pulling
@@ -31,11 +34,19 @@ COPY src/ ./src/
 COPY scripts/ ./scripts/
 COPY configs/ ./configs/
 
+# Install the upstream LeRobot MolmoAct2 policy at a pinned commit. Open
+# Badger adapts to this policy; it does not duplicate its model implementation.
+RUN git clone https://github.com/allenai/lerobot.git "$LEROBOT_ROOT" \
+    && git -C "$LEROBOT_ROOT" checkout "$LEROBOT_COMMIT"
+
 # Install Open Badger and all current development/training extras. The extra
 # PyTorch index supplies the CUDA-compatible wheels declared in pyproject.toml.
 RUN python3 -m pip install --upgrade pip setuptools \
     && python3 -m pip install \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
-        -e ".[dev,training,model,data,lora,logging]"
+        -e ".[dev,training,model,data,lora,logging]" \
+    && python3 -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        -e "$LEROBOT_ROOT[molmoact2]"
 
 CMD ["bash"]

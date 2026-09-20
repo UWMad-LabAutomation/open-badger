@@ -26,9 +26,16 @@ class Model(nn.Module, ABC):
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__()
         self.config = dict(config or {})
-        self.model_name = self.config.get("name") or self.config.get("model_name") or self.__class__.__name__
-        self.device = self._resolve_device(self.config.get("device"))
-        self.dtype = self._resolve_dtype(self.config.get("dtype"))
+        model_config = self.config.get("model", {}) or {}
+        runtime_config = self.config.get("runtime", {}) or {}
+        self.model_name = (
+            self.config.get("name")
+            or self.config.get("model_name")
+            or model_config.get("name")
+            or self.__class__.__name__
+        )
+        self.device = self._resolve_device(self.config.get("device", runtime_config.get("device")))
+        self.dtype = self._resolve_dtype(self.config.get("dtype", runtime_config.get("dtype")))
         self.checkpoint_path = self.config.get("checkpoint") or self.config.get("checkpoint_path")
 
         self.build_network()
@@ -152,163 +159,129 @@ class Model(nn.Module, ABC):
 
 
 class MolmoAct2(Model):
-    """MolmoAct2 vision-language-action policy (allenai/MolmoAct2).
-
-    Wraps the official Hugging Face checkpoint: a Molmo2-ER vision-language
-    backbone connected to a flow-matching continuous action expert via
-    per-layer KV conditioning. Outputs are continuous, absolute joint/encoder
-    position targets.
-
-    `forward()` wraps the checkpoint's documented `predict_action()` API,
-    which is inference-only (`@torch.no_grad()` internally) and is the
-    correct, robot-safe way to produce actions in the checkpoint's native
-    format. It is not differentiable. The training objective in
-    `compute_loss()` will need a separate, gradient-carrying path through the
-    flow-matching action expert and is deferred until that work starts.
-    """
+    """Open Badger adapter around the official LeRobot MolmoAct2 policy."""
 
     model_name = "molmoact2"
 
     def build_network(self) -> None:
         try:
-            from transformers import AutoModelForImageTextToText, AutoProcessor
+            from lerobot.configs import FeatureType, PolicyFeature
+            from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
+            from lerobot.policies.molmoact2.modeling_molmoact2 import MolmoAct2Policy
         except ImportError as exc:
             raise ImportError(
-                "MolmoAct2 requires the 'transformers' package. Install the "
-                "project's 'model' extra to use this checkpoint."
+                "MolmoAct2 requires the official LeRobot MolmoAct2 policy. "
+                "Build the Docker image or install the pinned lerobot[molmoact2] dependency."
             ) from exc
 
-        checkpoint_cfg = self.config.get("checkpoint", {}) or {}
+        model_cfg = self.config.get("model", self.config) or {}
+        checkpoint_cfg = model_cfg.get("checkpoint", {}) or {}
+        runtime_cfg = self.config.get("runtime", {}) or {}
+        inference_cfg = self.config.get("inference", {}) or {}
+        training_cfg = self.config.get("training", {}) or {}
+
         repo_id = checkpoint_cfg.get("repo_id", "allenai/MolmoAct2")
         revision = checkpoint_cfg.get("revision")
-        cache_dir = checkpoint_cfg.get("cache_dir")
-        local_files_only = bool(checkpoint_cfg.get("local_files_only", False))
-        attn_implementation = (self.config.get("optimization", {}) or {}).get("attention")
-
-        self.hf_model = AutoModelForImageTextToText.from_pretrained(
-            repo_id,
-            revision=revision,
-            cache_dir=cache_dir,
-            local_files_only=local_files_only,
-            trust_remote_code=True,
-            torch_dtype=self.dtype,
-            attn_implementation=attn_implementation,
-        )
-        self.hf_model.to(self.device)
-
-        self.processor = AutoProcessor.from_pretrained(
-            repo_id,
-            revision=revision,
-            cache_dir=cache_dir,
-            local_files_only=local_files_only,
-            trust_remote_code=True,
-        )
-
-        inference_cfg = self.config.get("inference", {}) or {}
         self.norm_tag = inference_cfg.get("norm_tag")
-        self.action_mode = inference_cfg.get("action_mode", "continuous")
-        # Expected to already be in the dataset-agnostic naming scheme produced
-        # by the data-loading layer, not raw per-robot camera names.
+        self.action_mode = training_cfg.get("action_mode", "continuous")
         self.image_keys = list(inference_cfg.get("image_keys") or [])
+        if not self.image_keys:
+            raise ValueError(
+                "MolmoAct2 requires inference.image_keys so the official LeRobot "
+                "policy can build its visual input features."
+            )
         self.n_action_steps = inference_cfg.get("n_action_steps")
-        self.num_flow_matching_steps = inference_cfg.get("flow_matching_steps")
-        self.action_dim = int(inference_cfg.get("action_dim", 32))
+        self.num_flow_matching_steps = int(
+            training_cfg.get("flow_matching_steps", inference_cfg.get("flow_matching_steps", 8))
+        )
+        self.action_dim = int(inference_cfg.get("action_dim", model_cfg.get("max_action_dim", 32)))
+        self.action_horizon = int(inference_cfg.get("action_horizon", 1))
+        max_action_horizon = int(
+            model_cfg.get("max_action_horizon", 30)
+        )
+        if self.action_horizon < 1 or self.action_horizon > max_action_horizon:
+            raise ValueError(
+                "`inference.action_horizon` must be between 1 and the checkpoint "
+                f"maximum ({max_action_horizon}), got {self.action_horizon}."
+            )
+        if self.n_action_steps is None:
+            self.n_action_steps = self.action_horizon
+        if int(self.n_action_steps) > self.action_horizon:
+            raise ValueError(
+                "`inference.n_action_steps` cannot exceed `inference.action_horizon`."
+            )
         self.history_length = int(inference_cfg.get("history_length", 1))
         if self.history_length < 1:
             raise ValueError("`inference.history_length` must be >= 1.")
 
-    def preprocess_batch(self, batch: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Convert a Lerobot2-like batch into per-example MolmoAct2 inputs.
+        state_dim = int(inference_cfg.get("state_dim", self.action_dim))
+        input_features = {
+            key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
+            for key in self.image_keys
+        }
+        input_features["observation.state"] = PolicyFeature(
+            type=FeatureType.STATE,
+            shape=(state_dim,),
+        )
+        output_features = {
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(self.action_dim,))
+        }
 
-        Expects `batch` to provide `task` (instruction strings),
-        `observation.state` (robot state vectors), and one
-        `observation.images.*` entry per key configured in
-        `inference.image_keys` (order matters; it must match the checkpoint's
-        expected camera order). When `inference.history_length > 1`, each
-        value is a sequence of that many stacked frames (oldest-to-newest)
-        instead of a single frame. Returns a list of per-example dicts with
-        `images`, `task`, and `state` for the current frame; the
-        `predict_action()` call this feeds is Markovian regardless of
-        `history_length`, but `observation_history` is attached for models/
-        forward paths that consume the full window.
+        policy_config = MolmoAct2Config(
+            checkpoint_path=repo_id,
+            checkpoint_revision=revision,
+            chunk_size=self.action_horizon,
+            n_action_steps=int(self.n_action_steps),
+            action_mode=self.action_mode,
+            inference_action_mode=inference_cfg.get("action_mode", "continuous"),
+            norm_tag=self.norm_tag,
+            image_keys=self.image_keys,
+            num_flow_timesteps=self.num_flow_matching_steps,
+            expected_max_action_dim=int(model_cfg.get("max_action_dim", 32)),
+            model_dtype=str(runtime_cfg.get("dtype", "bfloat16")),
+            train_mode_vlm=training_cfg.get("train_mode_vlm", "lora"),
+            gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", False)),
+            input_features=input_features,
+            output_features=output_features,
+            device=str(self.device),
+        )
+        self.policy = MolmoAct2Policy(policy_config)
+        self.policy.to(self.device)
+
+    def preprocess_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return a batch prepared for the official LeRobot policy.
+
+        Universal Open Badger data preprocessing owns conversion from raw
+        LeRobot observations to this tensor contract. The official policy then
+        owns image/token processing, action normalization, and padding masks.
         """
-        if not self.image_keys:
-            raise ValueError(
-                "MolmoAct2 requires `inference.image_keys` to be configured with "
-                "the ordered observation image keys for this checkpoint."
-            )
+        if not isinstance(batch, Mapping):
+            raise TypeError("MolmoAct2 expects a mapping batch.")
+        return batch
 
-        tasks = batch["task"]
-        states = batch["observation.state"]
-        batch_size = len(tasks)
+    def forward(self, inputs: Mapping[str, Any], **kwargs: Any) -> torch.Tensor:
+        """Delegate inference-time action generation to the official policy."""
+        if not isinstance(inputs, Mapping):
+            raise TypeError("MolmoAct2.forward() expects an official tensor batch mapping.")
+        return self.policy.predict_action_chunk(
+            dict(inputs),
+            inference_action_mode=kwargs.get("inference_action_mode"),
+            num_steps=kwargs.get("num_steps", self.num_flow_matching_steps),
+        )
 
-        examples = []
-        for idx in range(batch_size):
-            current_images = []
-            image_history: dict[str, Any] = {}
-            for image_key in self.image_keys:
-                current, window = self.select_history_window(
-                    batch[image_key][idx], history_length=self.history_length
-                )
-                current_images.append(current)
-                if window is not None:
-                    image_history[image_key] = window
-
-            current_state, state_history = self.select_history_window(
-                states[idx], history_length=self.history_length
-            )
-            if torch.is_tensor(current_state):
-                current_state = current_state.detach().cpu().numpy()
-
-            example: dict[str, Any] = {
-                "images": current_images,
-                "task": tasks[idx],
-                "state": current_state,
-            }
-            if self.history_length > 1:
-                example["observation_history"] = {"images": image_history, "state": state_history}
-            examples.append(example)
-        return examples
-
-    def forward(self, inputs: list[dict[str, Any]], **kwargs: Any) -> torch.Tensor:
-        """Run MolmoAct2's continuous flow-matching action head.
-
-        `inputs` is the list of per-example dicts produced by
-        `preprocess_batch()`. Returns a `(batch, n_action_steps, action_dim)`
-        tensor of absolute joint/encoder position targets, already
-        unnormalized to the robot's native units by the checkpoint's
-        `norm_stats.json`.
-        """
-        if self.norm_tag is None:
-            raise ValueError(
-                "MolmoAct2 requires `inference.norm_tag` to be set in the model "
-                "config (selects normalization stats from the checkpoint's "
-                "norm_stats.json)."
-            )
-
-        action_chunks = []
-        for example in inputs:
-            output = self.hf_model.predict_action(
-                processor=self.processor,
-                images=example["images"],
-                task=example["task"],
-                state=example["state"],
-                norm_tag=self.norm_tag,
-                inference_action_mode=self.action_mode,
-                num_steps=self.num_flow_matching_steps,
-                n_action_steps=self.n_action_steps,
-                return_dict=True,
-            )
-            action_chunks.append(output.actions[..., : self.action_dim])
-
-        return torch.cat(action_chunks, dim=0)
+    def training_step(self, batch: Mapping[str, Any]) -> dict[str, Any]:
+        """Delegate training and loss computation to official LeRobot code."""
+        prepared_batch = self.preprocess_batch(batch)
+        loss, metrics = self.policy(dict(prepared_batch), reduction="mean")
+        return {"loss": loss, "metrics": metrics}
 
     def compute_loss(self, batch: Any, outputs: Any) -> torch.Tensor:
-        raise NotImplementedError(
-            "MolmoAct2 compute_loss() is intentionally left for the flow-matching "
-            "training objective, which needs a separate gradient-carrying path "
-            "through the action expert."
-        )
+        """Return a loss produced by the official policy forward method."""
+        if isinstance(outputs, tuple):
+            return outputs[0]
+        if torch.is_tensor(outputs):
+            return outputs
+        raise TypeError("Official MolmoAct2 outputs must be a (loss, metrics) tuple or tensor.")
 
 
 class ModelRegistry:
@@ -363,7 +336,8 @@ class ModelRegistry:
         if not isinstance(config, dict):
             raise TypeError("Model config must be a dictionary.")
 
-        name = config.get("name") or config.get("model") or config.get("model_name")
+        model_config = config.get("model", config)
+        name = config.get("name") or config.get("model_name") or model_config.get("name")
         if name is None:
             raise KeyError("Model config must define a 'name', 'model', or 'model_name'.")
 

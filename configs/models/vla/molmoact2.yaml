@@ -1,5 +1,9 @@
 model:
   name: molmoact2
+  # Fixed limits defined by the released checkpoint. The configured action
+  # horizon below must not exceed max_action_horizon.
+  max_action_dim: 32
+  max_action_horizon: 30
   checkpoint:
     source: huggingface
     repo_id: allenai/MolmoAct2
@@ -9,19 +13,30 @@ model:
 
 runtime:
   device: cuda:0
-  requires_grad: false
+  requires_grad: true
   backend: torch
-  dtype: float32
+  dtype: bfloat16
+
+training:
+  # Delegated to the official LeRobot MolmoAct2 policy.
+  action_mode: continuous
+  train_mode_vlm: lora
+  gradient_checkpointing: false
+  flow_matching_steps: 8
 
 inference:
   action_mode: continuous
   norm_tag: null
   sequence_length: null
-  flow_matching_steps: null
+  # Number of future control timesteps predicted per policy query.
+  action_horizon: 10
+  # Number of predicted actions consumed before querying the policy again.
+  n_action_steps: 10
+  # Internal flow integration steps; this is not the action horizon.
+  flow_matching_steps: 8
   # Ordered universal observation.images.* keys (renamed from raw dataset
   # camera names by the data-loading layer), not per-robot names like top/cam0.
   image_keys: []
-  n_action_steps: null
   action_dim: 32    # molmoact2 outputs actions and a 32D continuous action space
   # 1 = Markovian (current frame only). >1 stacks that many past frames per
   # observation key for benchmarking framestacked vs Markovian policies.

@@ -27,7 +27,7 @@ training = [
 ]
 
 model = [
-    "transformers>=4.57,<4.58",
+    "transformers>=5.4,<5.6",
     "accelerate>=1.0",
     "safetensors>=0.4",
     "huggingface-hub[cli]>=0.36",
