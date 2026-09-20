@@ -8,8 +8,7 @@ model:
     source: huggingface
     repo_id: allenai/MolmoAct2
     revision: null
-    cache_dir: null
-    local_files_only: false
+    force_download: false
 
 runtime:
   device: cuda:0
@@ -23,6 +22,41 @@ training:
   train_mode_vlm: lora
   gradient_checkpointing: false
   flow_matching_steps: 8
+  flow_matching_cutoff: 1.0
+  flow_matching_time_offset: 0.001
+  flow_matching_time_scale: 0.999
+  flow_matching_beta_alpha: 1.0
+  flow_matching_beta_beta: 1.5
+  mask_action_dim_padding: true
+  enable_knowledge_insulation: false
+  freeze_embedding: true
+  llm_residual_dropout: 0.1
+
+  lora:
+    rank: 64
+    alpha: 16
+    dropout: 0.05
+    bias: none
+
+  optimizer:
+    learning_rate: 1.0e-5
+    vision_learning_rate: 5.0e-6
+    connector_learning_rate: 5.0e-6
+    action_expert_learning_rate: 5.0e-5
+    betas: [0.9, 0.95]
+    eps: 1.0e-6
+    weight_decay: 0.0
+    grad_clip_norm: 1.0
+
+  scheduler:
+    warmup_steps: 200
+    decay_steps: null
+    decay_learning_rate: 1.0e-6
+
+  normalization:
+    visual: identity
+    state: quantiles
+    action: quantiles
 
 inference:
   action_mode: continuous
@@ -34,12 +68,20 @@ inference:
   n_action_steps: 10
   # Internal flow integration steps; this is not the action horizon.
   flow_matching_steps: 8
-  # Ordered universal observation.images.* keys (renamed from raw dataset
-  # camera names by the data-loading layer), not per-robot names like top/cam0.
+  num_inference_steps: null
+  setup_type: ""
+  control_mode: ""
+  normalize_language: true
+  normalize_gripper: false
+  add_setup_tokens: true
+  add_control_tokens: true
+  max_sequence_length: null
+  enable_inference_cuda_graph: false
+  per_episode_seed: false
+  eval_seed: null
+  state_dim: 32
   image_keys: []
   action_dim: 32    # molmoact2 outputs actions and a 32D continuous action space
-  # 1 = Markovian (current frame only). >1 stacks that many past frames per
-  # observation key for benchmarking framestacked vs Markovian policies.
   history_length: 1
 
 optimization:

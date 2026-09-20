@@ -165,7 +165,7 @@ class MolmoAct2(Model):
 
     def build_network(self) -> None:
         try:
-            from lerobot.configs import FeatureType, PolicyFeature
+            from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
             from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
             from lerobot.policies.molmoact2.modeling_molmoact2 import MolmoAct2Policy
         except ImportError as exc:
@@ -182,6 +182,17 @@ class MolmoAct2(Model):
 
         repo_id = checkpoint_cfg.get("repo_id", "allenai/MolmoAct2")
         revision = checkpoint_cfg.get("revision")
+        training_lora_cfg = training_cfg.get("lora", {}) or {}
+        training_optimizer_cfg = training_cfg.get("optimizer", {}) or {}
+        training_scheduler_cfg = training_cfg.get("scheduler", {}) or {}
+        normalization_cfg = training_cfg.get("normalization", {}) or {}
+
+        normalization_mapping = {
+            "VISUAL": NormalizationMode[str(normalization_cfg.get("visual", "identity")).upper()],
+            "STATE": NormalizationMode[str(normalization_cfg.get("state", "quantiles")).upper()],
+            "ACTION": NormalizationMode[str(normalization_cfg.get("action", "quantiles")).upper()],
+        }
+
         self.norm_tag = inference_cfg.get("norm_tag")
         self.action_mode = training_cfg.get("action_mode", "continuous")
         self.image_keys = list(inference_cfg.get("image_keys") or [])
@@ -230,17 +241,57 @@ class MolmoAct2(Model):
         policy_config = MolmoAct2Config(
             checkpoint_path=repo_id,
             checkpoint_revision=revision,
+            checkpoint_force_download=bool(checkpoint_cfg.get("force_download", False)),
+            n_obs_steps=int(inference_cfg.get("history_length", 1)),
             chunk_size=self.action_horizon,
             n_action_steps=int(self.n_action_steps),
             action_mode=self.action_mode,
             inference_action_mode=inference_cfg.get("action_mode", "continuous"),
             norm_tag=self.norm_tag,
+            setup_type=str(inference_cfg.get("setup_type", "")),
+            control_mode=str(inference_cfg.get("control_mode", "")),
             image_keys=self.image_keys,
+            normalize_language=bool(inference_cfg.get("normalize_language", True)),
+            normalize_gripper=bool(inference_cfg.get("normalize_gripper", False)),
+            add_setup_tokens=bool(inference_cfg.get("add_setup_tokens", True)),
+            add_control_tokens=bool(inference_cfg.get("add_control_tokens", True)),
+            max_sequence_length=inference_cfg.get("max_sequence_length"),
             num_flow_timesteps=self.num_flow_matching_steps,
+            flow_matching_cutoff=float(training_cfg.get("flow_matching_cutoff", 1.0)),
+            flow_matching_time_offset=float(training_cfg.get("flow_matching_time_offset", 0.001)),
+            flow_matching_time_scale=float(training_cfg.get("flow_matching_time_scale", 0.999)),
+            flow_matching_beta_alpha=float(training_cfg.get("flow_matching_beta_alpha", 1.0)),
+            flow_matching_beta_beta=float(training_cfg.get("flow_matching_beta_beta", 1.5)),
+            mask_action_dim_padding=bool(training_cfg.get("mask_action_dim_padding", True)),
             expected_max_action_dim=int(model_cfg.get("max_action_dim", 32)),
             model_dtype=str(runtime_cfg.get("dtype", "bfloat16")),
             train_mode_vlm=training_cfg.get("train_mode_vlm", "lora"),
+            lora_rank=int(training_lora_cfg.get("rank", 64)),
+            lora_alpha=int(training_lora_cfg.get("alpha", 16)),
+            lora_dropout=float(training_lora_cfg.get("dropout", 0.05)),
+            lora_bias=str(training_lora_cfg.get("bias", "none")),
+            enable_knowledge_insulation=bool(training_cfg.get("enable_knowledge_insulation", False)),
+            freeze_embedding=bool(training_cfg.get("freeze_embedding", True)),
             gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", False)),
+            llm_residual_dropout=float(training_cfg.get("llm_residual_dropout", 0.1)),
+            optimizer_lr=float(training_optimizer_cfg.get("learning_rate", 1.0e-5)),
+            optimizer_vit_lr=float(training_optimizer_cfg.get("vision_learning_rate", 5.0e-6)),
+            optimizer_connector_lr=float(training_optimizer_cfg.get("connector_learning_rate", 5.0e-6)),
+            optimizer_action_expert_lr=float(
+                training_optimizer_cfg.get("action_expert_learning_rate", 5.0e-5)
+            ),
+            optimizer_betas=tuple(training_optimizer_cfg.get("betas", [0.9, 0.95])),
+            optimizer_eps=float(training_optimizer_cfg.get("eps", 1.0e-6)),
+            optimizer_weight_decay=float(training_optimizer_cfg.get("weight_decay", 0.0)),
+            optimizer_grad_clip_norm=float(training_optimizer_cfg.get("grad_clip_norm", 1.0)),
+            scheduler_warmup_steps=int(training_scheduler_cfg.get("warmup_steps", 200)),
+            scheduler_decay_steps=training_scheduler_cfg.get("decay_steps"),
+            scheduler_decay_lr=float(training_scheduler_cfg.get("decay_learning_rate", 1.0e-6)),
+            normalization_mapping=normalization_mapping,
+            num_inference_steps=inference_cfg.get("num_inference_steps"),
+            enable_inference_cuda_graph=bool(inference_cfg.get("enable_inference_cuda_graph", False)),
+            per_episode_seed=bool(inference_cfg.get("per_episode_seed", False)),
+            eval_seed=inference_cfg.get("eval_seed"),
             input_features=input_features,
             output_features=output_features,
             device=str(self.device),
