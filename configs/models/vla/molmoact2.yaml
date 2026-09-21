@@ -36,92 +36,53 @@ training:
 finetuning:
   selected_strategy: lora
 
+  # Shared by every fine-tuning strategy.
+  action_mode: continuous
+  flow_matching_steps: 8
+  flow_matching_cutoff: 1.0
+  flow_matching_time_offset: 0.001
+  flow_matching_time_scale: 0.999
+  flow_matching_beta_alpha: 1.0
+  flow_matching_beta_beta: 1.5
+  mask_action_dim_padding: true
+  enable_knowledge_insulation: false
+  freeze_embedding: true
+  llm_residual_dropout: 0.1
+
+  lora:
+    rank: 64
+    alpha: 16
+    dropout: 0.05
+    bias: none
+
+  optimizer:
+    learning_rate: 1.0e-5
+    vision_learning_rate: 5.0e-6
+    connector_learning_rate: 5.0e-6
+    action_expert_learning_rate: 5.0e-5
+    betas: [0.9, 0.95]
+    eps: 1.0e-6
+    weight_decay: 0.0
+    grad_clip_norm: 1.0
+
+  scheduler:
+    warmup_steps: 200
+    decay_steps: null
+    decay_learning_rate: 1.0e-6
+
+  # Strategies only override behavior that genuinely differs.
   strategies:
     lora:
       train_mode_vlm: lora
       gradient_checkpointing: false
-      flow_matching_steps: 8
-      flow_matching_cutoff: 1.0
-      flow_matching_time_offset: 0.001
-      flow_matching_time_scale: 0.999
-      flow_matching_beta_alpha: 1.0
-      flow_matching_beta_beta: 1.5
-      mask_action_dim_padding: true
-      enable_knowledge_insulation: false
-      freeze_embedding: true
-      llm_residual_dropout: 0.1
-      lora:
-        rank: 64
-        alpha: 16
-        dropout: 0.05
-        bias: none
-      optimizer:
-        learning_rate: 1.0e-5
-        vision_learning_rate: 5.0e-6
-        connector_learning_rate: 5.0e-6
-        action_expert_learning_rate: 5.0e-5
-        betas: [0.9, 0.95]
-        eps: 1.0e-6
-        weight_decay: 0.0
-        grad_clip_norm: 1.0
-      scheduler:
-        warmup_steps: 200
-        decay_steps: null
-        decay_learning_rate: 1.0e-6
 
     full_finetune:
       train_mode_vlm: fft
       gradient_checkpointing: true
-      flow_matching_steps: 8
-      flow_matching_cutoff: 1.0
-      flow_matching_time_offset: 0.001
-      flow_matching_time_scale: 0.999
-      flow_matching_beta_alpha: 1.0
-      flow_matching_beta_beta: 1.5
-      mask_action_dim_padding: true
-      enable_knowledge_insulation: false
-      freeze_embedding: true
-      llm_residual_dropout: 0.1
-      optimizer:
-        learning_rate: 1.0e-5
-        vision_learning_rate: 5.0e-6
-        connector_learning_rate: 5.0e-6
-        action_expert_learning_rate: 5.0e-5
-        betas: [0.9, 0.95]
-        eps: 1.0e-6
-        weight_decay: 0.0
-        grad_clip_norm: 1.0
-      scheduler:
-        warmup_steps: 200
-        decay_steps: null
-        decay_learning_rate: 1.0e-6
 
     action_expert_only:
       train_mode_vlm: freeze
       gradient_checkpointing: false
-      flow_matching_steps: 8
-      flow_matching_cutoff: 1.0
-      flow_matching_time_offset: 0.001
-      flow_matching_time_scale: 0.999
-      flow_matching_beta_alpha: 1.0
-      flow_matching_beta_beta: 1.5
-      mask_action_dim_padding: true
-      enable_knowledge_insulation: false
-      freeze_embedding: true
-      llm_residual_dropout: 0.1
-      optimizer:
-        learning_rate: 1.0e-5
-        vision_learning_rate: 5.0e-6
-        connector_learning_rate: 5.0e-6
-        action_expert_learning_rate: 5.0e-5
-        betas: [0.9, 0.95]
-        eps: 1.0e-6
-        weight_decay: 0.0
-        grad_clip_norm: 1.0
-      scheduler:
-        warmup_steps: 200
-        decay_steps: null
-        decay_learning_rate: 1.0e-6
 
 inference:
   inference_action_mode: continuous

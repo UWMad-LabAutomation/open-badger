@@ -24,6 +24,11 @@ embodiment:
 text:
   normalize_language: true
 
+normalization:
+  visual: identity
+  state: quantiles
+  action: quantiles
+
 sampling:
   # Number of future control timesteps in each action chunk.
   action_horizon: 10

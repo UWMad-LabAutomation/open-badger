@@ -175,17 +175,32 @@ class MolmoAct2(Model):
             ) from exc
 
         model_cfg = self.config.get("model", self.config) or {}
+        data_cfg = self.config.get("data", {}) or {}
         checkpoint_cfg = model_cfg.get("checkpoint", {}) or {}
         runtime_cfg = self.config.get("runtime", {}) or {}
         inference_cfg = self.config.get("inference", {}) or {}
-        training_cfg = self.config.get("training", {}) or {}
+        finetuning_cfg = self.config.get("finetuning", {}) or {}
+        strategy_name = str(finetuning_cfg.get("selected_strategy", "lora"))
+        strategies = finetuning_cfg.get("strategies", {}) or {}
+        strategy_cfg = strategies.get(strategy_name)
+        if not isinstance(strategy_cfg, dict):
+            raise KeyError(
+                f"Unknown MolmoAct2 fine-tuning strategy {strategy_name!r}. "
+                f"Available strategies: {', '.join(sorted(strategies)) or 'none'}."
+            )
+        training_cfg = {key: value for key, value in finetuning_cfg.items() if key != "strategies"}
+        training_cfg.update(strategy_cfg)
+        data_features_cfg = data_cfg.get("features", {}) or {}
+        data_sampling_cfg = data_cfg.get("sampling", {}) or {}
+        data_embodiment_cfg = data_cfg.get("embodiment", {}) or {}
+        data_text_cfg = data_cfg.get("text", {}) or {}
 
         repo_id = checkpoint_cfg.get("repo_id", "allenai/MolmoAct2")
         revision = checkpoint_cfg.get("revision")
         training_lora_cfg = training_cfg.get("lora", {}) or {}
         training_optimizer_cfg = training_cfg.get("optimizer", {}) or {}
         training_scheduler_cfg = training_cfg.get("scheduler", {}) or {}
-        normalization_cfg = training_cfg.get("normalization", {}) or {}
+        normalization_cfg = data_cfg.get("normalization", {}) or {}
 
         normalization_mapping = {
             "VISUAL": NormalizationMode[str(normalization_cfg.get("visual", "identity")).upper()],
@@ -195,37 +210,37 @@ class MolmoAct2(Model):
 
         self.norm_tag = inference_cfg.get("norm_tag")
         self.action_mode = training_cfg.get("action_mode", "continuous")
-        self.image_keys = list(inference_cfg.get("image_keys") or [])
+        self.image_keys = list(data_features_cfg.get("image_keys") or [])
         if not self.image_keys:
             raise ValueError(
-                "MolmoAct2 requires inference.image_keys so the official LeRobot "
+                "MolmoAct2 requires data.features.image_keys so the official LeRobot "
                 "policy can build its visual input features."
             )
         self.n_action_steps = inference_cfg.get("n_action_steps")
         self.num_flow_matching_steps = int(
             training_cfg.get("flow_matching_steps", inference_cfg.get("flow_matching_steps", 8))
         )
-        self.action_dim = int(inference_cfg.get("action_dim", model_cfg.get("max_action_dim", 32)))
-        self.action_horizon = int(inference_cfg.get("action_horizon", 1))
+        self.action_dim = int(data_features_cfg.get("action_dim") or model_cfg.get("max_action_dim", 32))
+        self.action_horizon = int(data_sampling_cfg.get("action_horizon", 1))
         max_action_horizon = int(
             model_cfg.get("max_action_horizon", 30)
         )
         if self.action_horizon < 1 or self.action_horizon > max_action_horizon:
             raise ValueError(
-                "`inference.action_horizon` must be between 1 and the checkpoint "
+                "`data.sampling.action_horizon` must be between 1 and the checkpoint "
                 f"maximum ({max_action_horizon}), got {self.action_horizon}."
             )
         if self.n_action_steps is None:
             self.n_action_steps = self.action_horizon
         if int(self.n_action_steps) > self.action_horizon:
             raise ValueError(
-                "`inference.n_action_steps` cannot exceed `inference.action_horizon`."
+                "`inference.n_action_steps` cannot exceed `data.sampling.action_horizon`."
             )
-        self.history_length = int(inference_cfg.get("history_length", 1))
+        self.history_length = int(data_sampling_cfg.get("observation_history_steps", 1))
         if self.history_length < 1:
-            raise ValueError("`inference.history_length` must be >= 1.")
+            raise ValueError("`data.sampling.observation_history_steps` must be >= 1.")
 
-        state_dim = int(inference_cfg.get("state_dim", self.action_dim))
+        state_dim = int(data_features_cfg.get("state_dim") or 0)
         input_features = {
             key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
             for key in self.image_keys
@@ -242,17 +257,17 @@ class MolmoAct2(Model):
             checkpoint_path=repo_id,
             checkpoint_revision=revision,
             checkpoint_force_download=bool(checkpoint_cfg.get("force_download", False)),
-            n_obs_steps=int(inference_cfg.get("history_length", 1)),
+            n_obs_steps=self.history_length,
             chunk_size=self.action_horizon,
             n_action_steps=int(self.n_action_steps),
             action_mode=self.action_mode,
-            inference_action_mode=inference_cfg.get("action_mode", "continuous"),
+            inference_action_mode=inference_cfg.get("inference_action_mode", "continuous"),
             norm_tag=self.norm_tag,
-            setup_type=str(inference_cfg.get("setup_type", "")),
-            control_mode=str(inference_cfg.get("control_mode", "")),
+            setup_type=str(data_embodiment_cfg.get("setup_type", "")),
+            control_mode=str(data_embodiment_cfg.get("control_mode", "")),
             image_keys=self.image_keys,
-            normalize_language=bool(inference_cfg.get("normalize_language", True)),
-            normalize_gripper=bool(inference_cfg.get("normalize_gripper", False)),
+            normalize_language=bool(data_text_cfg.get("normalize_language", True)),
+            normalize_gripper=bool(data_embodiment_cfg.get("normalize_gripper", False)),
             add_setup_tokens=bool(inference_cfg.get("add_setup_tokens", True)),
             add_control_tokens=bool(inference_cfg.get("add_control_tokens", True)),
             max_sequence_length=inference_cfg.get("max_sequence_length"),
