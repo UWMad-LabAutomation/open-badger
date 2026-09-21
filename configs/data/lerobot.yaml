@@ -1,0 +1,51 @@
+# Canonical LeRobot source, manifest, sampling, and loader settings.
+# Dataset-dependent dimensions and timing belong here, not in model configs.
+
+source:
+  backend: huggingface  # huggingface, s3, or local
+  dataset_id: null
+  revision: null
+  root: null
+  format: auto  # auto, v1, v2, or v3
+
+features:
+  # Ordered universal observation image keys. The reader may populate these
+  # from dataset metadata when left empty.
+  image_keys: []
+  # Optional overrides used only when source metadata is incomplete.
+  action_dim: null
+  state_dim: null
+
+embodiment:
+  setup_type: ""
+  control_mode: ""
+  normalize_gripper: false
+
+text:
+  normalize_language: true
+
+sampling:
+  # Number of future control timesteps in each action chunk.
+  action_horizon: 10
+  observation_history_steps: 1
+  # Null means one dataset frame per control step (1 / dataset FPS).
+  action_spacing_seconds: null
+  observation_history_seconds: 0.0
+  drop_incomplete_horizons: true
+  shuffle: true
+  seed: 42
+
+manifest:
+  directory: null
+  rebuild: false
+
+cache:
+  directory: null
+  mode: manifest  # manifest or materialized
+  read_only: false
+
+loader:
+  batch_size: 32
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
