@@ -29,24 +29,26 @@ RUN apt-get update \
 # Keep project packages out of Ubuntu's externally managed system Python.
 RUN python3 -m venv "$VIRTUAL_ENV"
 
-COPY pyproject.toml README.md ./
-COPY src/ ./src/
-COPY scripts/ ./scripts/
-COPY configs/ ./configs/
-
 # Install the upstream LeRobot MolmoAct2 policy at a pinned commit. Open
 # Badger adapts to this policy; it does not duplicate its model implementation.
 RUN git clone https://github.com/allenai/lerobot.git "$LEROBOT_ROOT" \
     && git -C "$LEROBOT_ROOT" checkout "$LEROBOT_COMMIT"
+
+# Keep the upstream dependency layer independent from Open Badger source edits.
+RUN python3 -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        -e "$LEROBOT_ROOT[molmoact2,dataset]"
+
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY configs/ ./configs/
 
 # Install Open Badger and all current development/training extras. The extra
 # PyTorch index supplies the CUDA-compatible wheels declared in pyproject.toml.
 RUN python3 -m pip install --upgrade pip setuptools \
     && python3 -m pip install \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
-        -e ".[dev,training,model,data,lora,logging]" \
-    && python3 -m pip install \
-        --extra-index-url https://download.pytorch.org/whl/cu128 \
-        -e "$LEROBOT_ROOT[molmoact2]"
+        -e ".[dev,training,model,data,lora,logging]"
 
 CMD ["bash"]
