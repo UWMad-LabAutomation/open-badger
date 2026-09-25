@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections.abc import Iterable, Iterator
 
 from open_badger.data.schema import DatasetMetadata, SamplePointer, TrainingExampleRef
 
@@ -33,7 +34,7 @@ def action_frame_offsets(
 
 def build_training_examples(
     metadata: DatasetMetadata,
-    pointers: list[SamplePointer],
+    pointers: Iterable[SamplePointer],
     *,
     action_horizon: int,
     action_spacing_seconds: float | None = None,
@@ -42,12 +43,42 @@ def build_training_examples(
     shuffle: bool = False,
     seed: int | None = None,
 ) -> list[TrainingExampleRef]:
+    return list(
+        iter_training_examples(
+            metadata,
+            pointers,
+            action_horizon=action_horizon,
+            action_spacing_seconds=action_spacing_seconds,
+            observation_history_seconds=observation_history_seconds,
+            drop_incomplete_horizons=drop_incomplete_horizons,
+            shuffle=shuffle,
+            seed=seed,
+        )
+    )
+
+
+def iter_training_examples(
+    metadata: DatasetMetadata,
+    pointers: Iterable[SamplePointer],
+    *,
+    action_horizon: int,
+    action_spacing_seconds: float | None = None,
+    observation_history_seconds: float = 0.0,
+    drop_incomplete_horizons: bool = True,
+    shuffle: bool = False,
+    seed: int | None = None,
+) -> Iterator[TrainingExampleRef]:
     """Build canonical example references from frame pointers.
 
     This function does not read tensors or decode video. It only validates
-    temporal references against episode metadata and creates a deterministic
-    manifest-ready list.
+    temporal references against episode metadata and yields manifest-ready
+    references. Shuffling is supported for the in-memory compatibility path;
+    disk-backed manifests should be shuffled by the training sampler.
     """
+    if shuffle:
+        pointers = list(pointers)
+        random.Random(seed).shuffle(pointers)
+
     if observation_history_seconds < 0:
         raise ValueError("observation_history_seconds must be non-negative.")
 
@@ -56,7 +87,6 @@ def build_training_examples(
         fps=metadata.fps,
         action_spacing_seconds=action_spacing_seconds,
     )
-    examples: list[TrainingExampleRef] = []
     for pointer in pointers:
         if pointer.dataset_id != metadata.dataset_id or pointer.revision != metadata.revision:
             raise ValueError("Pointer dataset identity does not match metadata.")
@@ -75,19 +105,13 @@ def build_training_examples(
 
         action_feature = metadata.action_feature
         state_feature = metadata.state_feature
-        examples.append(
-            TrainingExampleRef(
-                sample=pointer,
-                action_horizon=action_horizon,
-                action_frame_offsets=offsets,
-                observation_history_seconds=observation_history_seconds,
-                camera_keys=metadata.camera_keys,
-                task=metadata.tasks.get(pointer.episode_index),
-                action_dim=(None if action_feature is None else action_feature.shape[-1]),
-                state_dim=(None if state_feature is None else state_feature.shape[-1]),
-            )
+        yield TrainingExampleRef(
+            sample=pointer,
+            action_horizon=action_horizon,
+            action_frame_offsets=offsets,
+            observation_history_seconds=observation_history_seconds,
+            camera_keys=metadata.camera_keys,
+            task=metadata.tasks.get(pointer.episode_index),
+            action_dim=(None if action_feature is None else action_feature.shape[-1]),
+            state_dim=(None if state_feature is None else state_feature.shape[-1]),
         )
-
-    if shuffle:
-        random.Random(seed).shuffle(examples)
-    return examples

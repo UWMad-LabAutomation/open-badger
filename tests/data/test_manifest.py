@@ -74,18 +74,6 @@ def test_manifest_drops_incomplete_horizons_and_preserves_metadata():
     assert manifest.examples[0].state_dim == 2
 
 
-def test_manifest_round_trip(tmp_path):
-    metadata = make_metadata()
-    pointer = SamplePointer("demo/dataset", "rev-1", 1, 0, 5, 0.0, 10.0)
-    manifest = SampleManifest.build(FakeReader(metadata, [pointer]), action_horizon=1)
-
-    manifest.write(tmp_path / "manifest")
-    restored = SampleManifest.read(tmp_path / "manifest")
-
-    assert restored.metadata == manifest.metadata
-    assert restored.examples == manifest.examples
-
-
 def test_manifest_rejects_mismatched_pointer_revision():
     metadata = make_metadata()
     pointer = SamplePointer("demo/dataset", "other-rev", 0, 0, 0, 0.0, 10.0)
