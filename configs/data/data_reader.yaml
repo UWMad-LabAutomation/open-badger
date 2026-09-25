@@ -1,4 +1,4 @@
-# Canonical LeRobot source, manifest, sampling, and loader settings.
+# Dataset reader, manifest, sampling, and PyTorch loader settings.
 # Dataset-dependent dimensions and timing belong here, not in model configs.
 
 source:
@@ -43,6 +43,8 @@ sampling:
 manifest:
   directory: null
   rebuild: false
+  # Number of reference rows buffered per Parquet write.
+  write_batch_size: 4096
 
 cache:
   directory: null

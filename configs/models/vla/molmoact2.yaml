@@ -34,8 +34,7 @@ training:
     every_steps: 10
 
 finetuning:
-  selected_strategy: lora
-
+  # The active strategy is selected by the high-level training config.
   # Shared by every fine-tuning strategy.
   action_mode: continuous
   flow_matching_steps: 8

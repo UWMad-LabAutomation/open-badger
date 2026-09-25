@@ -1,0 +1,9 @@
+# Model-agnostic high-level training composition.
+# This file selects configs; model-specific settings stay in the referenced files.
+
+model:
+  config: ../models/vla/molmoact2.yaml
+  strategy: lora
+
+data:
+  config: ../data/data_reader.yaml
