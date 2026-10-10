@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +37,6 @@ class LeRobotReader:
 
         self.dataset = dataset
         self._metadata: DatasetMetadata | None = None
-        self._pointers: list[SamplePointer] | None = None
-        self._relative_indices: dict[int, int] | None = None
 
     def metadata(self) -> DatasetMetadata:
         """Return LeRobot metadata normalized to the canonical schema."""
@@ -62,44 +60,44 @@ class LeRobotReader:
             )
         return self._metadata
 
-    def iter_pointers(self) -> Iterable[SamplePointer]:
-        """Yield one pointer for every LeRobot dataset row."""
-        if self._pointers is None:
-            pointers: list[SamplePointer] = []
-            relative_indices: dict[int, int] = {}
-            for relative_index in range(len(self.dataset)):
-                row = self._raw_row(relative_index)
-                global_index = _scalar(row["index"])
-                pointer = SamplePointer(
-                    dataset_id=str(self.dataset.repo_id),
-                    revision=str(self.dataset.revision),
-                    episode_index=int(_scalar(row["episode_index"])),
-                    episode_frame_index=int(_scalar(row["frame_index"])),
-                    global_frame_index=int(global_index),
-                    timestamp=float(_scalar(row["timestamp"])),
-                    fps=self.metadata().fps,
-                )
-                pointers.append(pointer)
-                relative_indices[int(global_index)] = relative_index
-            self._pointers = pointers
-            self._relative_indices = relative_indices
-        return iter(self._pointers)
+    def iter_pointers(self) -> Iterator[SamplePointer]:
+        """Yield frame pointers lazily without caching a dataset-sized index."""
+        metadata = self.metadata()
+        for dataset_index in range(len(self.dataset)):
+            row = self._raw_row(dataset_index)
+            yield SamplePointer(
+                dataset_id=metadata.dataset_id,
+                revision=metadata.revision,
+                episode_index=int(_scalar(row["episode_index"])),
+                episode_frame_index=int(_scalar(row["frame_index"])),
+                global_frame_index=int(_scalar(row["index"])),
+                timestamp=float(_scalar(row["timestamp"])),
+                fps=metadata.fps,
+                dataset_index=dataset_index,
+            )
 
     def get_frame(self, pointer: SamplePointer) -> Mapping[str, Any]:
         """Resolve a canonical pointer to LeRobot's decoded frame mapping."""
         self._validate_pointer(pointer)
-        if pointer.global_frame_index is None:
-            raise ValueError("LeRobot frame lookup requires global_frame_index.")
-        if self._relative_indices is None:
-            list(self.iter_pointers())
-        assert self._relative_indices is not None
-        try:
-            relative_index = self._relative_indices[pointer.global_frame_index]
-        except KeyError as exc:
-            raise KeyError(
-                f"Frame {pointer.global_frame_index} is not available in the dataset."
-            ) from exc
-        return dict(self.dataset[relative_index])
+        if pointer.dataset_index is None:
+            raise ValueError("LeRobot frame lookup requires dataset_index.")
+        if pointer.dataset_index >= len(self.dataset):
+            raise KeyError(f"Dataset index {pointer.dataset_index} is not available.")
+
+        row = self._raw_row(pointer.dataset_index)
+        expected = (
+            pointer.global_frame_index,
+            pointer.episode_index,
+            pointer.episode_frame_index,
+        )
+        actual = (
+            int(_scalar(row["index"])),
+            int(_scalar(row["episode_index"])),
+            int(_scalar(row["frame_index"])),
+        )
+        if actual != expected:
+            raise ValueError("Pointer dataset_index does not match its frame identifiers.")
+        return dict(self.dataset[pointer.dataset_index])
 
     def _validate_pointer(self, pointer: SamplePointer) -> None:
         metadata = self.metadata()

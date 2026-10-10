@@ -121,7 +121,7 @@ class DatasetMetadata:
 
 @dataclass(frozen=True)
 class SamplePointer:
-    """Stable reference to one frame in a canonical dataset."""
+    """Canonical frame identity with an optional direct reader index."""
 
     dataset_id: str
     revision: str
@@ -130,12 +130,16 @@ class SamplePointer:
     global_frame_index: int | None
     timestamp: float
     fps: float
+    # Index into the reader's opened dataset view for direct frame access.
+    dataset_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.episode_index < 0 or self.episode_frame_index < 0:
             raise ValueError("Episode and frame indices must be non-negative.")
         if self.global_frame_index is not None and self.global_frame_index < 0:
             raise ValueError("global_frame_index must be non-negative.")
+        if self.dataset_index is not None and self.dataset_index < 0:
+            raise ValueError("dataset_index must be non-negative.")
         if self.timestamp < 0 or self.fps <= 0:
             raise ValueError("timestamp must be non-negative and fps must be positive.")
 
@@ -148,6 +152,7 @@ class SamplePointer:
             "global_frame_index": self.global_frame_index,
             "timestamp": self.timestamp,
             "fps": self.fps,
+            "dataset_index": self.dataset_index,
         }
 
     @classmethod
@@ -162,6 +167,9 @@ class SamplePointer:
             ),
             timestamp=float(value["timestamp"]),
             fps=float(value["fps"]),
+            dataset_index=(
+                None if value.get("dataset_index") is None else int(value["dataset_index"])
+            ),
         )
 
 
