@@ -44,8 +44,8 @@ class FeatureMetadata:
             kind=str(value["kind"]),
             shape=tuple(int(dimension) for dimension in value.get("shape", ())),
             dtype=str(value["dtype"]),
-            names=tuple(str(name) for name in value.get("names", ())),
-            units=tuple(str(unit) for unit in value.get("units", ())),
+            names=tuple(str(name) for name in value.get("names") or ()),
+            units=tuple(str(unit) for unit in value.get("units") or ()),
         )
 
 

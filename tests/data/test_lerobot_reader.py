@@ -94,6 +94,18 @@ def test_lerobot_reader_normalizes_metadata_and_pointers():
     assert [pointer.dataset_index for pointer in pointers] == [0, 1, 2]
 
 
+def test_lerobot_reader_normalizes_null_optional_feature_metadata():
+    dataset = FakeDataset()
+    dataset.meta.features["action"]["names"] = None
+    dataset.meta.features["action"]["units"] = None
+    reader = LeRobotReader("demo/dataset", dataset=dataset)
+
+    feature = reader.metadata().features["action"]
+
+    assert feature.names == ()
+    assert feature.units == ()
+
+
 def test_lerobot_reader_resolves_frame_by_global_pointer():
     reader = LeRobotReader("demo/dataset", dataset=FakeDataset())
     pointer = next(pointer for pointer in reader.iter_pointers() if pointer.global_frame_index == 101)

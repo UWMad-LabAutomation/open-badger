@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 from open_badger.data.schema import (
@@ -127,6 +128,73 @@ def test_build_training_dataloader_resolves_manifest_and_batches():
 
     assert batch["observation.state"].shape == (1, 2)
     assert batch["action"].shape == (1, 2, 2)
+
+
+def test_build_training_dataloader_caps_workers_to_available_examples():
+    reader = FakeReader()
+    example = TrainingExampleRef(
+        sample=SamplePointer(
+            "demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0, dataset_index=0
+        ),
+        action_horizon=1,
+        action_frame_offsets=(0,),
+        action_dim=2,
+        state_dim=2,
+    )
+
+    with pytest.warns(UserWarning, match="fewer independent work shards"):
+        loader = build_training_dataloader(
+            reader,
+            [example],
+            {
+                "sampling": {"shuffle": False},
+                "loader": {
+                    "batch_size": 1,
+                    "num_workers": 4,
+                    "persistent_workers": False,
+                },
+            },
+        )
+
+    assert loader.num_workers == 1
+
+
+def test_build_training_dataloader_serializes_unsplittable_iterables():
+    class SizedIterable:
+        def __init__(self, examples):
+            self.examples = examples
+
+        def __len__(self):
+            return len(self.examples)
+
+        def __iter__(self):
+            return iter(self.examples)
+
+    reader = FakeReader()
+    example = TrainingExampleRef(
+        sample=SamplePointer(
+            "demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0, dataset_index=0
+        ),
+        action_horizon=1,
+        action_frame_offsets=(0,),
+        action_dim=2,
+        state_dim=2,
+    )
+    with pytest.warns(UserWarning, match="fewer independent work shards"):
+        loader = build_training_dataloader(
+            reader,
+            SizedIterable([example]),
+            {
+                "sampling": {"shuffle": False},
+                "loader": {
+                    "batch_size": 1,
+                    "num_workers": 4,
+                    "persistent_workers": False,
+                },
+            },
+        )
+
+    assert loader.num_workers == 1
 
 
 def test_train_from_manifest_passes_resolved_action_chunk_to_model():

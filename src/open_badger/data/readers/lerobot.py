@@ -150,8 +150,8 @@ class LeRobotReader:
             kind=kind,
             shape=tuple(int(dimension) for dimension in feature.get("shape", ())),
             dtype=dtype,
-            names=tuple(str(value) for value in feature.get("names", ())),
-            units=tuple(str(value) for value in feature.get("units", ())),
+            names=tuple(str(value) for value in feature.get("names") or ()),
+            units=tuple(str(value) for value in feature.get("units") or ()),
         )
 
     @staticmethod

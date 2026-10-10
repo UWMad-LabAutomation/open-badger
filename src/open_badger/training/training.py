@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import warnings
 import torch
 from torch import nn
 import yaml
@@ -125,6 +126,8 @@ def build_training_dataloader(
     reader: DatasetReader,
     manifest: Iterable[TrainingExampleRef],
     data_config: Mapping[str, Any],
+    *,
+    include_action: bool = True,
 ) -> DataLoader:
     """Compose manifest resolution and PyTorch batching from data config."""
     sampling_config = data_config.get("sampling", {}) or {}
@@ -132,6 +135,29 @@ def build_training_dataloader(
     num_workers = int(loader_config.get("num_workers", 0))
     if num_workers < 0:
         raise ValueError("loader.num_workers must be non-negative.")
+    try:
+        manifest_size = len(manifest)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError("Training manifests must provide a length for worker allocation.") from exc
+    if manifest_size < 1:
+        raise ValueError("Cannot build a training loader from an empty manifest.")
+    manifest_shards = getattr(manifest, "num_shards", None)
+    if manifest_shards is not None:
+        available_shards = int(manifest_shards)
+    elif hasattr(manifest, "examples") or isinstance(manifest, (list, tuple)):
+        available_shards = manifest_size
+    else:
+        available_shards = 1
+    if available_shards < 1:
+        raise ValueError("The training manifest has no readable Parquet row groups.")
+    worker_limit = min(manifest_size, available_shards)
+    if num_workers > worker_limit:
+        warnings.warn(
+            f"Reducing DataLoader workers from {num_workers} to {worker_limit}: "
+            "the manifest has fewer independent work shards.",
+            stacklevel=2,
+        )
+        num_workers = worker_limit
     batch_size = int(loader_config.get("batch_size", 1))
     if batch_size < 1:
         raise ValueError("loader.batch_size must be positive.")
@@ -145,6 +171,7 @@ def build_training_dataloader(
         shuffle=bool(sampling_config.get("shuffle", False)),
         shuffle_buffer_size=int(loader_config.get("shuffle_buffer_size", 1024)),
         seed=int(sampling_config.get("seed", 0)),
+        include_action=include_action,
     )
     return DataLoader(
         dataset,

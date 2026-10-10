@@ -63,3 +63,9 @@ def test_build_parquet_streams_and_round_trips_references(tmp_path):
     assert [example.sample.dataset_index for example in restored] == [0, 1]
     assert all(example.action_frame_offsets == (0, 1) for example in restored)
     assert (tmp_path / "manifest" / "examples.parquet").exists()
+    assert restored.num_shards == 2
+    shard_examples = [
+        *restored.iter_shard(0, 2),
+        *restored.iter_shard(1, 2),
+    ]
+    assert sorted(example.sample.global_frame_index for example in shard_examples) == [0, 1]

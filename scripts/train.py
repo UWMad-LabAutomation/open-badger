@@ -93,6 +93,34 @@ def _run_smoke_test(model: torch.nn.Module, batches: Any) -> None:
                 print(f"  {name}: {value}")
 
 
+def _run_inference_smoke_test(model: torch.nn.Module, batches: Any) -> None:
+    predict_from_batch = getattr(model, "predict_action_chunk_from_batch", None)
+    if not callable(predict_from_batch):
+        raise TypeError("The selected model does not support raw-batch action prediction.")
+    model.eval()
+    try:
+        batch = next(iter(batches))
+    except StopIteration as exc:
+        raise ValueError("The inference manifest produced no batches.") from exc
+
+    with torch.inference_mode():
+        actions = predict_from_batch(batch)
+    if not torch.is_tensor(actions) or actions.ndim != 3:
+        raise TypeError(
+            "Inference smoke test expected an action tensor with shape "
+            "[batch, horizon, action_dim]."
+        )
+    if actions.shape[0] != 1 or actions.shape[1] < 1 or actions.shape[2] < 1:
+        raise ValueError(f"Unexpected predicted action chunk shape: {tuple(actions.shape)}.")
+    if not bool(torch.isfinite(actions).all()):
+        raise FloatingPointError("MolmoAct2 produced non-finite actions.")
+    print(
+        "Inference smoke test passed: "
+        f"action_shape={tuple(actions.shape)}, "
+        f"range=[{actions.min().item():.4f}, {actions.max().item():.4f}]"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -102,20 +130,54 @@ def main() -> None:
         help="High-level training YAML config.",
     )
     parser.add_argument("--dataset-id", help="Override data.source.dataset_id.")
+    parser.add_argument(
+        "--backend",
+        choices=("huggingface", "local"),
+        help="Override data.source.backend.",
+    )
+    parser.add_argument("--data-root", type=Path, help="Override data.source.root.")
+    parser.add_argument(
+        "--episodes",
+        nargs="+",
+        type=int,
+        help="Override data.source.episodes with selected episode indices.",
+    )
+    parser.add_argument(
+        "--image-keys",
+        nargs="+",
+        help="Override data.features.image_keys with selected camera features.",
+    )
     parser.add_argument("--revision", help="Override data.source.revision.")
     parser.add_argument("--manifest-dir", type=Path, help="Override data.manifest.directory.")
     parser.add_argument("--strategy", help="Override the configured fine-tuning strategy.")
     parser.add_argument("--batch-size", type=int, help="Override data.loader.batch_size.")
+    parser.add_argument("--num-workers", type=int, help="Override data.loader.num_workers.")
     parser.add_argument("--max-steps", type=int, help="Override training.training.max_steps.")
-    parser.add_argument(
+    smoke_tests = parser.add_mutually_exclusive_group()
+    smoke_tests.add_argument(
         "--smoke-test",
         action="store_true",
-        help="Run one forward/loss batch without backward or optimizer updates.",
+        help="Run one supervised forward/loss batch without backward or optimizer updates.",
+    )
+    smoke_tests.add_argument(
+        "--inference-smoke-test",
+        action="store_true",
+        help="Predict one action chunk from a real observation batch.",
     )
     args = parser.parse_args()
 
     model_config, data_config = load_training_config(args.config, strategy=args.strategy)
     source = dict(data_config.get("source", {}) or {})
+    if args.backend is not None:
+        source["backend"] = args.backend
+    if args.data_root is not None:
+        source["root"] = str(args.data_root)
+    if args.episodes is not None:
+        source["episodes"] = args.episodes
+    data_config["source"] = source
+    if args.image_keys is not None:
+        data_config.setdefault("features", {})["image_keys"] = args.image_keys
+
     backend = str(source.get("backend", "huggingface")).lower()
     if backend not in {"huggingface", "local"}:
         raise ValueError(f"Data source backend {backend!r} is not implemented.")
@@ -164,8 +226,15 @@ def main() -> None:
         if args.batch_size < 1:
             raise ValueError("--batch-size must be positive.")
         data_config.setdefault("loader", {})["batch_size"] = args.batch_size
-    elif args.smoke_test:
+    elif args.smoke_test or args.inference_smoke_test:
         data_config.setdefault("loader", {})["batch_size"] = 1
+    if args.num_workers is not None:
+        if args.num_workers < 0:
+            raise ValueError("--num-workers must be non-negative.")
+        loader_config = data_config.setdefault("loader", {})
+        loader_config["num_workers"] = args.num_workers
+        if args.num_workers == 0:
+            loader_config["persistent_workers"] = False
 
     print(
         f"Dataset: {metadata.dataset_id} @ {metadata.revision}; "
@@ -179,6 +248,19 @@ def main() -> None:
         _run_smoke_test(
             model,
             build_training_dataloader(reader, manifest, data_config),
+        )
+        return
+    if args.inference_smoke_test:
+        from open_badger.training.training import build_training_dataloader
+
+        _run_inference_smoke_test(
+            model,
+            build_training_dataloader(
+                reader,
+                manifest,
+                data_config,
+                include_action=False,
+            ),
         )
         return
 

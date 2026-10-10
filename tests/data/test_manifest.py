@@ -52,6 +52,22 @@ def test_action_offsets_follow_dataset_fps():
     assert action_frame_offsets(action_horizon=3, fps=10.0, action_spacing_seconds=0.2) == (0, 2, 4)
 
 
+def test_feature_metadata_from_dict_normalizes_null_optional_labels():
+    feature = FeatureMetadata.from_dict(
+        {
+            "name": "action",
+            "kind": "action",
+            "shape": [3],
+            "dtype": "float32",
+            "names": None,
+            "units": None,
+        }
+    )
+
+    assert feature.names == ()
+    assert feature.units == ()
+
+
 def test_manifest_drops_incomplete_horizons_and_preserves_metadata():
     metadata = make_metadata()
     pointers = [

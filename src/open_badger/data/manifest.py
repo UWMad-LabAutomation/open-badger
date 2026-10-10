@@ -162,10 +162,26 @@ class ParquetManifest:
     def __len__(self) -> int:
         return self.row_count
 
-    def __iter__(self):
+    @property
+    def num_shards(self) -> int:
+        """Number of Parquet row groups available for independent reading."""
         parquet_file = pq.ParquetFile(self.directory / "examples.parquet")
-        for batch in parquet_file.iter_batches():
-            for row in batch.to_pylist():
+        return parquet_file.metadata.num_row_groups
+
+    def __iter__(self):
+        yield from self.iter_shard(0, 1)
+
+    def iter_shard(self, shard_id: int, num_shards: int):
+        """Read only this shard's row groups, without scanning other workers' rows."""
+        if num_shards < 1:
+            raise ValueError("num_shards must be positive.")
+        if shard_id < 0 or shard_id >= num_shards:
+            raise ValueError("shard_id must be between zero and num_shards - 1.")
+
+        parquet_file = pq.ParquetFile(self.directory / "examples.parquet")
+        for row_group_index in range(shard_id, parquet_file.metadata.num_row_groups, num_shards):
+            row_group = parquet_file.read_row_group(row_group_index)
+            for row in row_group.to_pylist():
                 yield _row_to_example(row)
 
     @classmethod

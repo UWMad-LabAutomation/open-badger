@@ -407,6 +407,18 @@ class MolmoAct2(Model):
 
     def preprocess_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
         """Use the official LeRobot pipeline to prepare a raw training batch."""
+        return self._preprocess_batch(batch, require_action=True)
+
+    def preprocess_observation_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Prepare observations for action prediction without a supervised target."""
+        return self._preprocess_batch(batch, require_action=False)
+
+    def _preprocess_batch(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        require_action: bool,
+    ) -> Mapping[str, Any]:
         if not isinstance(batch, Mapping):
             raise TypeError("MolmoAct2 expects a mapping batch.")
         if self.preprocessor is None:
@@ -433,24 +445,27 @@ class MolmoAct2(Model):
 
         action = prepared.get("action")
         if action is None:
-            raise KeyError("MolmoAct2 training batches require an 'action' chunk.")
-        action_tensor = torch.as_tensor(action, dtype=torch.float32)
-        if action_tensor.ndim != 3:
-            raise ValueError(
-                "Expected action chunks with shape [batch, horizon, action_dim], "
-                f"got {tuple(action_tensor.shape)}."
-            )
-        if action_tensor.shape[1] != self.action_horizon:
-            raise ValueError(
-                f"Action horizon {action_tensor.shape[1]} does not match configured "
-                f"horizon {self.action_horizon}."
-            )
-        if action_tensor.shape[2] > self.max_action_dim:
-            raise ValueError(
-                f"Action dim {action_tensor.shape[2]} exceeds MolmoAct2 maximum "
-                f"{self.max_action_dim}."
-            )
-        prepared["action"] = action_tensor
+            if require_action:
+                raise KeyError("MolmoAct2 training batches require an 'action' chunk.")
+            prepared.pop("action", None)
+        else:
+            action_tensor = torch.as_tensor(action, dtype=torch.float32)
+            if action_tensor.ndim != 3:
+                raise ValueError(
+                    "Expected action chunks with shape [batch, horizon, action_dim], "
+                    f"got {tuple(action_tensor.shape)}."
+                )
+            if action_tensor.shape[1] != self.action_horizon:
+                raise ValueError(
+                    f"Action horizon {action_tensor.shape[1]} does not match configured "
+                    f"horizon {self.action_horizon}."
+                )
+            if action_tensor.shape[2] > self.max_action_dim:
+                raise ValueError(
+                    f"Action dim {action_tensor.shape[2]} exceeds MolmoAct2 maximum "
+                    f"{self.max_action_dim}."
+                )
+            prepared["action"] = action_tensor
 
         for image_key in self.image_keys:
             image = prepared.get(image_key)
@@ -463,6 +478,15 @@ class MolmoAct2(Model):
         if not isinstance(processed, Mapping):
             raise TypeError("The official MolmoAct2 preprocessor must return a mapping.")
         return processed
+
+    def predict_action_chunk_from_batch(
+        self,
+        batch: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Preprocess raw observations and predict a MolmoAct2 action chunk."""
+        inputs = self.preprocess_observation_batch(batch)
+        return self.forward(inputs, **kwargs)
 
     def forward(self, inputs: Mapping[str, Any], **kwargs: Any) -> torch.Tensor:
         """Delegate inference-time action generation to the official policy."""

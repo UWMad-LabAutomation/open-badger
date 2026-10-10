@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
+from torch.utils.data import DataLoader
 
 from open_badger.data.dataset import ManifestTrainingDataset
 from open_badger.data.schema import (
@@ -33,6 +34,7 @@ def make_metadata():
 @dataclass
 class FakeReader:
     dataset_metadata: DatasetMetadata
+    feature_calls: list[tuple[str, int]] = field(default_factory=list)
 
     def metadata(self):
         return self.dataset_metadata
@@ -45,6 +47,7 @@ class FakeReader:
 
     def get_feature(self, pointer, feature_name, *, frame_offset=0):
         assert feature_name == "action"
+        self.feature_calls.append((feature_name, frame_offset))
         return [pointer.episode_frame_index + frame_offset, 2.0]
 
 
@@ -78,6 +81,30 @@ def test_manifest_dataset_resolves_observation_and_action_chunk():
     assert resolved["action"].shape == (2, 2)
     assert resolved["action"].tolist() == [[0, 2.0], [1, 2.0]]
     assert resolved["task"] == "pick"
+    assert reader.feature_calls == [("action", 0), ("action", 1)]
+
+
+def test_manifest_dataset_can_resolve_observations_without_reading_actions():
+    reader = FakeReader(make_metadata())
+    pointer = SamplePointer(
+        "demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0, dataset_index=0
+    )
+    example = TrainingExampleRef(
+        sample=pointer,
+        action_horizon=1,
+        action_frame_offsets=(0,),
+        camera_keys=("observation.images.front",),
+        task="pick",
+        action_dim=2,
+        state_dim=2,
+    )
+    dataset = ManifestTrainingDataset(reader, [example], include_action=False)
+
+    resolved = next(iter(dataset))
+
+    assert "action" not in resolved
+    assert resolved["observation.state"].shape == (2,)
+    assert reader.feature_calls == []
 
 
 def test_manifest_dataset_shuffles_with_bounded_buffer_reproducibly():
@@ -114,3 +141,47 @@ def test_manifest_dataset_shuffles_with_bounded_buffer_reproducibly():
 
     assert first_order == second_order
     assert sorted(first_order) == [0.0, 1.0, 2.0]
+
+
+def test_manifest_workers_resolve_disjoint_preassigned_shards():
+    class ShardedManifest:
+        num_shards = 2
+
+        def __init__(self, examples):
+            self.examples = examples
+
+        def __len__(self):
+            return len(self.examples)
+
+        def iter_shard(self, shard_id, num_shards):
+            yield from self.examples[shard_id::num_shards]
+
+    reader = FakeReader(make_metadata())
+    examples = [
+        TrainingExampleRef(
+            sample=SamplePointer(
+                "demo/dataset",
+                "rev-1",
+                0,
+                index,
+                index,
+                index / 10.0,
+                10.0,
+                dataset_index=index,
+            ),
+            action_horizon=1,
+            action_frame_offsets=(0,),
+            action_dim=2,
+            state_dim=2,
+        )
+        for index in range(3)
+    ]
+    dataset = ManifestTrainingDataset(reader, ShardedManifest(examples))
+    loader = DataLoader(dataset, batch_size=1, num_workers=2)
+
+    resolved = [
+        batch["observation.state"][0, 0].item()
+        for batch in loader
+    ]
+
+    assert sorted(resolved) == [0.0, 1.0, 2.0]

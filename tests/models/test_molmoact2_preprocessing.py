@@ -38,7 +38,8 @@ def make_uninitialized_model():
                 "STATE": SimpleNamespace(name="QUANTILES"),
                 "ACTION": SimpleNamespace(name="QUANTILES"),
             }
-        )
+        ),
+        predict_action_chunk=lambda inputs, **kwargs: torch.ones(1, 10, 2),
     )
     model.image_keys = ["observation.images.front"]
     model.state_dim = 2
@@ -51,6 +52,7 @@ def make_uninitialized_model():
     model.postprocessor = None
     model._configured_dataset_metadata = None
     model._configured_native_metadata = None
+    model.num_flow_matching_steps = 8
     return model
 
 
@@ -110,3 +112,33 @@ def test_preprocess_batch_requires_dataset_processor():
         assert "configure_dataset" in str(exc)
     else:
         raise AssertionError("Expected preprocessing without dataset setup to fail.")
+
+
+def test_observation_preprocessing_and_action_prediction_need_no_target(monkeypatch):
+    import lerobot.policies
+
+    observed = {}
+
+    def processor(batch):
+        observed.update(batch)
+        return batch
+
+    monkeypatch.setattr(
+        lerobot.policies,
+        "make_pre_post_processors",
+        lambda *args, **kwargs: (processor, object()),
+    )
+    model = make_uninitialized_model()
+    model.configure_dataset(make_metadata())
+    batch = {
+        "observation.state": torch.tensor([[0.1, 0.2]]),
+        "observation.images.front": torch.full((1, 3, 2, 2), 255, dtype=torch.uint8),
+        "task": ["pick"],
+    }
+
+    actions = model.predict_action_chunk_from_batch(batch)
+
+    assert actions.shape == (1, 10, 2)
+    assert "action" not in observed
+    assert observed["observation.images.front"].dtype == torch.float32
+    assert torch.all(observed["observation.images.front"] == 1.0)

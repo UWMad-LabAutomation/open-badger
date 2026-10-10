@@ -40,10 +40,12 @@ case "$command" in
             set -- bash
         fi
 
+        mkdir -p "$ROOT_DIR/.cache/huggingface"
         docker run --rm -it \
             --name "$CONTAINER_NAME" \
             --runtime=nvidia \
             -e NVIDIA_VISIBLE_DEVICES=all \
+            -e HF_HOME=/workspace/open-badger/.cache/huggingface \
             --volume "$ROOT_DIR:/workspace/open-badger" \
             --workdir /workspace/open-badger \
             "$IMAGE_NAME" \

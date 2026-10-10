@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from itertools import islice
 from typing import Any
 
@@ -29,6 +29,7 @@ class ManifestTrainingDataset(IterableDataset):
         shuffle: bool = False,
         shuffle_buffer_size: int = 1024,
         seed: int = 0,
+        include_action: bool = True,
     ) -> None:
         super().__init__()
         if shuffle and shuffle_buffer_size < 1:
@@ -38,6 +39,7 @@ class ManifestTrainingDataset(IterableDataset):
         self.shuffle = shuffle
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
+        self.include_action = include_action
         self._epoch = 0
 
         metadata = reader.metadata()
@@ -61,11 +63,29 @@ class ManifestTrainingDataset(IterableDataset):
         epoch = self._epoch
         self._epoch += 1
 
-        examples = (
-            example
-            for index, example in enumerate(self.manifest)
-            if index % worker_count == worker_id
-        )
+        iter_shard = getattr(self.manifest, "iter_shard", None)
+        if callable(iter_shard):
+            examples = iter_shard(worker_id, worker_count)
+        elif hasattr(self.manifest, "examples"):
+            stored_examples = self.manifest.examples
+            examples = (
+                stored_examples[index]
+                for index in range(worker_id, len(stored_examples), worker_count)
+            )
+        elif isinstance(self.manifest, Sequence):
+            examples = (
+                self.manifest[index]
+                for index in range(worker_id, len(self.manifest), worker_count)
+            )
+        else:
+            if worker_count > 1:
+                raise ValueError(
+                    "Parallel loading requires a manifest with iter_shard() or "
+                    "random-access examples."
+                )
+            examples = (
+                example for example in self.manifest
+            )
         if self.shuffle:
             rng = random.Random(self.seed + epoch * worker_count + worker_id)
             examples = _shuffle_buffer(examples, self.shuffle_buffer_size, rng)
@@ -78,17 +98,20 @@ class ManifestTrainingDataset(IterableDataset):
         for feature in self.reader.metadata().features.values():
             if feature.kind == "state" and feature.name in frame:
                 frame[feature.name] = torch.as_tensor(frame[feature.name])
-        action_frames = [
-            torch.as_tensor(
-                self.reader.get_feature(
-                    example.sample,
-                    "action",
-                    frame_offset=offset,
+        if self.include_action:
+            action_frames = [
+                torch.as_tensor(
+                    self.reader.get_feature(
+                        example.sample,
+                        "action",
+                        frame_offset=offset,
+                    )
                 )
-            )
-            for offset in example.action_frame_offsets
-        ]
-        frame["action"] = torch.stack(action_frames)
+                for offset in example.action_frame_offsets
+            ]
+            frame["action"] = torch.stack(action_frames)
+        else:
+            frame.pop("action", None)
         frame["task"] = example.task or ""
         return frame
 
