@@ -57,7 +57,7 @@ def test_manifest_drops_incomplete_horizons_and_preserves_metadata():
     pointers = [
         SamplePointer("demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0),
         SamplePointer("demo/dataset", "rev-1", 0, 2, 2, 0.2, 10.0),
-        SamplePointer("demo/dataset", "rev-1", 1, 0, 5, 0.0, 10.0),
+        SamplePointer("demo/dataset", "rev-1", 1, 1, 6, 0.1, 10.0),
     ]
     manifest = SampleManifest.build(
         FakeReader(metadata, pointers),

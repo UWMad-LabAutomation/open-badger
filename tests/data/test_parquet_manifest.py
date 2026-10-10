@@ -44,9 +44,9 @@ def make_metadata():
 def test_build_parquet_streams_and_round_trips_references(tmp_path):
     metadata = make_metadata()
     pointers = [
-        SamplePointer("demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0),
-        SamplePointer("demo/dataset", "rev-1", 0, 1, 1, 0.1, 10.0),
-        SamplePointer("demo/dataset", "rev-1", 0, 2, 2, 0.2, 10.0),
+        SamplePointer("demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0, dataset_index=0),
+        SamplePointer("demo/dataset", "rev-1", 0, 1, 1, 0.1, 10.0, dataset_index=1),
+        SamplePointer("demo/dataset", "rev-1", 0, 2, 2, 0.2, 10.0, dataset_index=2),
     ]
 
     manifest = SampleManifest.build_parquet(
@@ -60,5 +60,6 @@ def test_build_parquet_streams_and_round_trips_references(tmp_path):
     assert len(manifest) == 2
     assert len(restored) == 2
     assert [example.sample.global_frame_index for example in restored] == [0, 1]
+    assert [example.sample.dataset_index for example in restored] == [0, 1]
     assert all(example.action_frame_offsets == (0, 1) for example in restored)
     assert (tmp_path / "manifest" / "examples.parquet").exists()
