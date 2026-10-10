@@ -89,8 +89,7 @@ class ManifestTrainingDataset(IterableDataset):
             for offset in example.action_frame_offsets
         ]
         frame["action"] = torch.stack(action_frames)
-        if example.task is not None:
-            frame["task"] = example.task
+        frame["task"] = example.task or ""
         return frame
 
 

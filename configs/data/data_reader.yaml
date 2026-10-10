@@ -6,6 +6,9 @@ source:
   dataset_id: null
   revision: null
   root: null
+  episodes: null
+  video_backend: null
+  download_videos: true
   format: auto  # auto, v1, v2, or v3
 
 features:

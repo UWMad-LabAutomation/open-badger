@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 
 from open_badger.data.schema import (
@@ -7,7 +9,9 @@ from open_badger.data.schema import (
     TrainingExampleRef,
 )
 from open_badger.training.training import (
+    build_optimizer,
     build_training_dataloader,
+    load_training_config,
     train,
     train_from_manifest,
 )
@@ -176,3 +180,54 @@ def test_train_from_manifest_passes_resolved_action_chunk_to_model():
 
     assert result.steps == 1
     assert model.action_shape == (1, 2, 2)
+
+
+def test_load_training_config_composes_referenced_model_and_data_configs():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    model_config, data_config = load_training_config(
+        repository_root / "configs/training/train.yaml"
+    )
+
+    assert model_config["model"]["name"] == "molmoact2"
+    assert model_config["finetuning"]["selected_strategy"] == "lora"
+    assert model_config["data"]["sampling"]["action_horizon"] == 10
+    assert data_config["manifest"]["rebuild"] is False
+
+
+def test_load_training_config_supports_strategy_override():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    model_config, _ = load_training_config(
+        repository_root / "configs/training/train.yaml",
+        strategy="action_expert_only",
+    )
+
+    assert model_config["finetuning"]["selected_strategy"] == "action_expert_only"
+
+
+def test_build_optimizer_uses_policy_parameter_groups():
+    model = ToyModel()
+    model.policy = type(
+        "PolicyWithOptimizerGroups",
+        (),
+        {"get_optim_params": lambda _self: [{"params": [model.weight], "lr": 0.03}]},
+    )()
+
+    optimizer = build_optimizer(
+        model,
+        {
+            "finetuning": {
+                "optimizer": {
+                    "learning_rate": 0.1,
+                    "betas": [0.8, 0.9],
+                    "eps": 1e-6,
+                    "weight_decay": 0.01,
+                }
+            }
+        },
+    )
+
+    assert optimizer.param_groups[0]["lr"] == 0.03
+    assert optimizer.defaults["lr"] == 0.1
+    assert optimizer.defaults["betas"] == (0.8, 0.9)

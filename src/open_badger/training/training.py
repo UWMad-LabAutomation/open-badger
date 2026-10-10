@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+import yaml
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
@@ -24,6 +26,50 @@ class TrainingResult:
     steps: int
     loss: float
     metrics: dict[str, float]
+
+
+def load_training_config(
+    config_path: str | Path,
+    *,
+    strategy: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load and compose the job, model, and data YAML configurations."""
+    job_path = Path(config_path).expanduser().resolve()
+    job_config = _read_yaml_mapping(job_path)
+    model_section = job_config.get("model")
+    data_section = job_config.get("data")
+    if not isinstance(model_section, Mapping) or not model_section.get("config"):
+        raise ValueError("Training config must define model.config.")
+    if not isinstance(data_section, Mapping) or not data_section.get("config"):
+        raise ValueError("Training config must define data.config.")
+
+    model_path = (job_path.parent / str(model_section["config"])).resolve()
+    data_path = (job_path.parent / str(data_section["config"])).resolve()
+    model_config = _read_yaml_mapping(model_path)
+    data_config = _read_yaml_mapping(data_path)
+
+    finetuning = dict(model_config.get("finetuning", {}) or {})
+    selected_strategy = strategy or str(model_section.get("strategy", "lora"))
+    strategies = finetuning.get("strategies", {}) or {}
+    if selected_strategy not in strategies:
+        available = ", ".join(sorted(str(strat) for strat in strategies)) or "none"
+        raise ValueError(
+            f"Unknown fine-tuning strategy {selected_strategy!r}; available strategies: {available}."
+        )
+    finetuning["selected_strategy"] = selected_strategy
+    model_config["finetuning"] = finetuning
+    model_config["data"] = data_config
+    return model_config, data_config
+
+
+def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+    try:
+        loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Configuration file does not exist: {path}") from exc
+    if not isinstance(loaded, dict):
+        raise TypeError(f"Configuration file must contain a YAML mapping: {path}")
+    return loaded
 
 
 def build_model(
@@ -52,6 +98,27 @@ def build_model(
     if dataset_metadata is not None:
         model.configure_dataset(dataset_metadata, native_metadata=native_metadata)
     return model
+
+
+def build_optimizer(model: nn.Module, model_config: Mapping[str, Any]) -> Optimizer:
+    """Build AdamW using MolmoAct2's parameter groups when provided."""
+    finetuning = model_config.get("finetuning", {}) or {}
+    optimizer_config = finetuning.get("optimizer", {}) or {}
+    policy = getattr(model, "policy", None)
+    if policy is not None and callable(getattr(policy, "get_optim_params", None)):
+        parameter_groups = policy.get_optim_params()
+    else:
+        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        parameter_groups = [{"params": trainable_parameters}]
+    if not parameter_groups or not any(group.get("params") for group in parameter_groups):
+        raise ValueError("The model has no trainable parameters.")
+    return torch.optim.AdamW(
+        parameter_groups,
+        lr=float(optimizer_config.get("learning_rate", 1.0e-4)),
+        betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
+        eps=float(optimizer_config.get("eps", 1.0e-8)),
+        weight_decay=float(optimizer_config.get("weight_decay", 0.0)),
+    )
 
 
 def build_training_dataloader(
