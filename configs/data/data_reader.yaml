@@ -56,3 +56,5 @@ loader:
   num_workers: 4
   pin_memory: true
   persistent_workers: true
+  # Bounded number of manifest references buffered for per-epoch shuffling.
+  shuffle_buffer_size: 1024

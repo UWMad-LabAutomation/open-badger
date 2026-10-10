@@ -19,3 +19,12 @@ class DatasetReader(Protocol):
 
     def get_frame(self, pointer: SamplePointer) -> Mapping[str, Any]:
         """Resolve one pointer to a raw canonical frame."""
+
+    def get_feature(
+        self,
+        pointer: SamplePointer,
+        feature_name: str,
+        *,
+        frame_offset: int = 0,
+    ) -> Any:
+        """Read one feature at an episode-relative frame offset."""

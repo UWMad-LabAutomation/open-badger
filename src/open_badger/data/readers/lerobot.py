@@ -79,25 +79,50 @@ class LeRobotReader:
     def get_frame(self, pointer: SamplePointer) -> Mapping[str, Any]:
         """Resolve a canonical pointer to LeRobot's decoded frame mapping."""
         self._validate_pointer(pointer)
+        dataset_index = self._resolve_dataset_index(pointer, frame_offset=0)
+        return dict(self.dataset[dataset_index])
+
+    def get_feature(
+        self,
+        pointer: SamplePointer,
+        feature_name: str,
+        *,
+        frame_offset: int = 0,
+    ) -> Any:
+        """Read a stored feature without decoding unrelated video columns."""
+        self._validate_pointer(pointer)
+        dataset_index = self._resolve_dataset_index(pointer, frame_offset=frame_offset)
+        row = self._raw_row(dataset_index)
+        try:
+            return row[feature_name]
+        except KeyError as exc:
+            raise KeyError(f"Dataset feature {feature_name!r} is not available.") from exc
+
+    def _resolve_dataset_index(self, pointer: SamplePointer, *, frame_offset: int) -> int:
+        if frame_offset < 0:
+            raise ValueError("frame_offset must be non-negative.")
         if pointer.dataset_index is None:
             raise ValueError("LeRobot frame lookup requires dataset_index.")
-        if pointer.dataset_index >= len(self.dataset):
-            raise KeyError(f"Dataset index {pointer.dataset_index} is not available.")
 
-        row = self._raw_row(pointer.dataset_index)
-        expected = (
-            pointer.global_frame_index,
-            pointer.episode_index,
-            pointer.episode_frame_index,
-        )
-        actual = (
-            int(_scalar(row["index"])),
-            int(_scalar(row["episode_index"])),
-            int(_scalar(row["frame_index"])),
-        )
-        if actual != expected:
-            raise ValueError("Pointer dataset_index does not match its frame identifiers.")
-        return dict(self.dataset[pointer.dataset_index])
+        dataset_index = pointer.dataset_index + frame_offset
+        if dataset_index >= len(self.dataset):
+            raise KeyError(f"Dataset index {dataset_index} is not available.")
+
+        row = self._raw_row(dataset_index)
+        expected_episode_frame = pointer.episode_frame_index + frame_offset
+        actual_episode = int(_scalar(row["episode_index"]))
+        actual_episode_frame = int(_scalar(row["frame_index"]))
+        if actual_episode != pointer.episode_index or actual_episode_frame != expected_episode_frame:
+            raise ValueError(
+                "Dataset indices are not contiguous with the requested episode frame."
+            )
+        if (
+            frame_offset == 0
+            and pointer.global_frame_index is not None
+            and int(_scalar(row["index"])) != pointer.global_frame_index
+        ):
+            raise ValueError("Pointer dataset_index does not match its global frame index.")
+        return dataset_index
 
     def _validate_pointer(self, pointer: SamplePointer) -> None:
         metadata = self.metadata()

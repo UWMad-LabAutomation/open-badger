@@ -14,6 +14,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from open_badger.data.schema import DatasetMetadata
+
 
 class Model(nn.Module, ABC):
     """Base class shared by all PyTorch policy implementations.
@@ -76,6 +78,19 @@ class Model(nn.Module, ABC):
     @property
     def name(self) -> str:
         return self.model_name
+
+    @property
+    def preprocessor_handles_device(self) -> bool:
+        """Whether batch preprocessing also places model inputs on the device."""
+        return False
+
+    def configure_dataset(
+        self,
+        metadata: DatasetMetadata,
+        *,
+        native_metadata: Any | None = None,
+    ) -> None:
+        """Configure optional model-specific preprocessing from dataset metadata."""
 
     @abstractmethod
     def build_network(self) -> None:
@@ -221,6 +236,7 @@ class MolmoAct2(Model):
             training_cfg.get("flow_matching_steps", inference_cfg.get("flow_matching_steps", 8))
         )
         self.action_dim = int(data_features_cfg.get("action_dim") or model_cfg.get("max_action_dim", 32))
+        self.max_action_dim = int(model_cfg.get("max_action_dim", 32))
         self.action_horizon = int(data_sampling_cfg.get("action_horizon", 1))
         max_action_horizon = int(
             model_cfg.get("max_action_horizon", 30)
@@ -241,6 +257,7 @@ class MolmoAct2(Model):
             raise ValueError("`data.sampling.observation_history_steps` must be >= 1.")
 
         state_dim = int(data_features_cfg.get("state_dim") or 0)
+        self.state_dim = state_dim
         input_features = {
             key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
             for key in self.image_keys
@@ -313,17 +330,139 @@ class MolmoAct2(Model):
         )
         self.policy = MolmoAct2Policy(policy_config)
         self.policy.to(self.device)
+        self.preprocessor = None
+        self.postprocessor = None
+        self._configured_dataset_metadata: DatasetMetadata | None = None
+        self._configured_native_metadata: Any | None = None
+
+    @property
+    def preprocessor_handles_device(self) -> bool:
+        return True
+
+    def configure_dataset(
+        self,
+        metadata: DatasetMetadata,
+        *,
+        native_metadata: Any | None = None,
+    ) -> None:
+        """Build LeRobot's MolmoAct2 input pipeline using this dataset's stats."""
+        if (
+            self.preprocessor is not None
+            and self._configured_dataset_metadata is metadata
+            and self._configured_native_metadata is native_metadata
+        ):
+            return
+
+        action_feature = metadata.action_feature
+        if (
+            action_feature is not None
+            and action_feature.shape
+            and self.action_dim < action_feature.shape[-1]
+        ):
+            raise ValueError(
+                f"Configured action_dim={self.action_dim} is smaller than dataset "
+                f"action dimension {action_feature.shape[-1]}."
+            )
+        state_feature = metadata.state_feature
+        if (
+            state_feature is not None
+            and state_feature.shape
+            and self.state_dim != state_feature.shape[-1]
+        ):
+            raise ValueError(
+                f"Configured state_dim={self.state_dim} does not match dataset "
+                f"state dimension {state_feature.shape[-1]}; build the model with "
+                "dataset metadata so feature dimensions can be inferred."
+            )
+        missing_cameras = set(self.image_keys).difference(metadata.camera_keys)
+        if missing_cameras:
+            raise ValueError(
+                f"Configured image keys are missing from the dataset: {sorted(missing_cameras)}."
+            )
+
+        if metadata.stats is None and self.norm_tag is None:
+            normalization = getattr(self.policy.config, "normalization_mapping", {})
+            required_stats = {
+                "STATE": "observation.state",
+                "ACTION": "action",
+            }
+            for mode_key, feature_key in required_stats.items():
+                mode = normalization.get(mode_key)
+                mode_name = getattr(mode, "name", str(mode)).upper()
+                if mode_name not in {"IDENTITY", "NONE"}:
+                    raise ValueError(
+                        f"Dataset statistics for {feature_key!r} are required by the "
+                        "configured MolmoAct2 normalization."
+                    )
+
+        from lerobot.policies import make_pre_post_processors
+
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            dataset_stats=metadata.stats,
+            dataset_meta=native_metadata,
+        )
+        self._configured_dataset_metadata = metadata
+        self._configured_native_metadata = native_metadata
 
     def preprocess_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Return a batch prepared for the official LeRobot policy.
-
-        Universal Open Badger data preprocessing owns conversion from raw
-        LeRobot observations to this tensor contract. The official policy then
-        owns image/token processing, action normalization, and padding masks.
-        """
+        """Use the official LeRobot pipeline to prepare a raw training batch."""
         if not isinstance(batch, Mapping):
             raise TypeError("MolmoAct2 expects a mapping batch.")
-        return batch
+        if self.preprocessor is None:
+            raise RuntimeError(
+                "MolmoAct2 dataset preprocessing is not configured; call "
+                "configure_dataset() with the source dataset metadata first."
+            )
+        if self.history_length != 1:
+            raise NotImplementedError(
+                "MolmoAct2 frame history is not yet assembled by the universal data loader."
+            )
+
+        prepared = dict(batch)
+        state = prepared.get("observation.state")
+        if state is None:
+            raise KeyError("MolmoAct2 training batches require 'observation.state'.")
+        state_tensor = torch.as_tensor(state, dtype=torch.float32)
+        if state_tensor.ndim != 2 or state_tensor.shape[-1] != self.state_dim:
+            raise ValueError(
+                "Expected observation.state with shape "
+                f"[batch, {self.state_dim}], got {tuple(state_tensor.shape)}."
+            )
+        prepared["observation.state"] = state_tensor
+
+        action = prepared.get("action")
+        if action is None:
+            raise KeyError("MolmoAct2 training batches require an 'action' chunk.")
+        action_tensor = torch.as_tensor(action, dtype=torch.float32)
+        if action_tensor.ndim != 3:
+            raise ValueError(
+                "Expected action chunks with shape [batch, horizon, action_dim], "
+                f"got {tuple(action_tensor.shape)}."
+            )
+        if action_tensor.shape[1] != self.action_horizon:
+            raise ValueError(
+                f"Action horizon {action_tensor.shape[1]} does not match configured "
+                f"horizon {self.action_horizon}."
+            )
+        if action_tensor.shape[2] > self.max_action_dim:
+            raise ValueError(
+                f"Action dim {action_tensor.shape[2]} exceeds MolmoAct2 maximum "
+                f"{self.max_action_dim}."
+            )
+        prepared["action"] = action_tensor
+
+        for image_key in self.image_keys:
+            image = prepared.get(image_key)
+            if not torch.is_tensor(image):
+                raise TypeError(f"Camera input {image_key!r} must be a tensor.")
+            if image.dtype == torch.uint8:
+                prepared[image_key] = image.to(dtype=torch.float32).div_(255.0)
+
+        processed = self.preprocessor(prepared)
+        if not isinstance(processed, Mapping):
+            raise TypeError("The official MolmoAct2 preprocessor must return a mapping.")
+        return processed
 
     def forward(self, inputs: Mapping[str, Any], **kwargs: Any) -> torch.Tensor:
         """Delegate inference-time action generation to the official policy."""
