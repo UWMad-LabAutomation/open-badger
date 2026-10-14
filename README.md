@@ -44,6 +44,16 @@ hf download lerobot/community_dataset_v3 \
   --include '00ri/so100_test/**'
 ```
 
+Prepare the local dataset by adding missing state/action quantile statistics
+without uploading or modifying the Hugging Face source:
+
+```bash
+./container.sh run python3 scripts/prepare_dataset.py \
+  --backend local \
+  --dataset-id local \
+  --data-root /workspace/open-badger/datasets/community_dataset_v3/00ri/so100_test
+```
+
 Then run an action-prediction smoke test:
 
 ```bash
