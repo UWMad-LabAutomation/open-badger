@@ -15,7 +15,7 @@ ENV LEROBOT_ROOT=/opt/lerobot
 
 WORKDIR /workspace/open-badger
 
-# Install only operating-system tools needed for Python development and pulling
+# Install operating-system tools needed for Python development and pulling
 # upstream model/data artifacts. GPU drivers remain provided by the host.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -50,5 +50,12 @@ RUN python3 -m pip install --upgrade pip setuptools \
     && python3 -m pip install \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         -e ".[dev,training,model,data,lora,logging]"
+
+# TorchCodec's FFmpeg 6 decoder needs the FFmpeg and shared Python libraries.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        python3.12-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 CMD ["bash"]
