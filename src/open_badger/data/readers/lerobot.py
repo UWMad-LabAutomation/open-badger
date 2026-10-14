@@ -183,8 +183,22 @@ def _rows(table: Any) -> list[Mapping[str, Any]]:
     if hasattr(table, "to_pylist"):
         return table.to_pylist()
     if hasattr(table, "to_dict"):
-        records = table.to_dict(orient="records")
-        return records
+        records = table.to_dict()
+        if not isinstance(records, Mapping):
+            return records
+        if not records:
+            return []
+        first_column = next(iter(records.values()))
+        if isinstance(first_column, Mapping):
+            row_indices = first_column.keys()
+            return [
+                {name: column[index] for name, column in records.items()}
+                for index in row_indices
+            ]
+        return [
+            dict(zip(records, row, strict=True))
+            for row in zip(*records.values(), strict=True)
+        ]
     return list(table)
 
 

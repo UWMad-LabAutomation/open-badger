@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    if hasattr(value, "tolist"):
+        normalized = value.tolist()
+        if normalized is not value:
+            return _json_compatible(normalized)
+    if hasattr(value, "item"):
+        normalized = value.item()
+        if normalized is not value:
+            return _json_compatible(normalized)
+    return value
 
 
 @dataclass(frozen=True)
@@ -97,7 +114,7 @@ class DatasetMetadata:
             "features": {name: feature.to_dict() for name, feature in self.features.items()},
             "episode_lengths": {str(index): length for index, length in self.episode_lengths.items()},
             "tasks": {str(index): task for index, task in self.tasks.items()},
-            "stats": self.stats,
+            "stats": _json_compatible(self.stats),
         }
 
     @classmethod

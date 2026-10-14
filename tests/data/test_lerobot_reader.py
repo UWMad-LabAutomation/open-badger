@@ -10,6 +10,14 @@ class FakeTasks:
     index: ClassVar[list[str]] = ["pick", "place"]
 
 
+class FakeEpisodeTable:
+    def __init__(self, values):
+        self.values = values
+
+    def to_dict(self):
+        return self.values
+
+
 class FakeDataset:
     repo_id = "demo/dataset"
     revision = "rev-1"
@@ -104,6 +112,27 @@ def test_lerobot_reader_normalizes_null_optional_feature_metadata():
 
     assert feature.names == ()
     assert feature.units == ()
+
+
+@pytest.mark.parametrize(
+    "episodes",
+    [
+        {"episode_index": [0], "length": [3], "tasks": [["pick"]]},
+        {
+            "episode_index": {0: 0},
+            "length": {0: 3},
+            "tasks": {0: ["pick"]},
+        },
+    ],
+)
+def test_lerobot_reader_normalizes_columnar_episode_metadata(episodes):
+    dataset = FakeDataset()
+    dataset.meta.episodes = FakeEpisodeTable(episodes)
+
+    metadata = LeRobotReader("demo/dataset", dataset=dataset).metadata()
+
+    assert metadata.episode_lengths == {0: 3}
+    assert metadata.tasks == {0: "pick"}
 
 
 def test_lerobot_reader_resolves_frame_by_global_pointer():

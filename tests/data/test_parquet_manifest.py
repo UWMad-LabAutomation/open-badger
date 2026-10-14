@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+import pytest
 
 from open_badger.data import (
     DatasetMetadata,
@@ -69,3 +71,28 @@ def test_build_parquet_streams_and_round_trips_references(tmp_path):
         *restored.iter_shard(1, 2),
     ]
     assert sorted(example.sample.global_frame_index for example in shard_examples) == [0, 1]
+
+
+def test_build_parquet_serializes_numpy_statistics(tmp_path):
+    np = pytest.importorskip("numpy")
+    metadata = replace(
+        make_metadata(),
+        stats={
+            "action": {
+                "mean": np.array([1.0, 2.0, 3.0]),
+                "count": np.int64(3),
+            }
+        },
+    )
+    pointer = SamplePointer("demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0)
+
+    SampleManifest.build_parquet(
+        FakeReader(metadata, [pointer]),
+        tmp_path / "manifest",
+        action_horizon=1,
+    )
+    restored = ParquetManifest.read(tmp_path / "manifest")
+
+    assert restored.metadata.stats == {
+        "action": {"mean": [1.0, 2.0, 3.0], "count": 3}
+    }
