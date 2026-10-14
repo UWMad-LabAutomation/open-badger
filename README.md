@@ -53,6 +53,7 @@ Then run an action-prediction smoke test:
   --data-root /workspace/open-badger/datasets/community_dataset_v3/00ri/so100_test \
   --episodes 0 \
   --image-keys observation.images.top \
+  --normalize-gripper \
   --manifest-dir /workspace/open-badger/outputs/manifests/00ri-so100-test-ep0 \
   --batch-size 1 \
   --num-workers 1 \
@@ -73,7 +74,7 @@ forward pass and loss calculation without backward or optimizer updates.
   data source, sampling, manifest, and loader settings.
 
 `scripts/train.py --help` lists command-line overrides, including dataset root,
-episodes, camera keys, batch size, and worker count.
+episodes, camera keys, gripper normalization, batch size, and worker count.
 
 ## Current limitations
 

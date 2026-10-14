@@ -147,6 +147,12 @@ def main() -> None:
         nargs="+",
         help="Override data.features.image_keys with selected camera features.",
     )
+    parser.add_argument(
+        "--normalize-gripper",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override data.embodiment.normalize_gripper.",
+    )
     parser.add_argument("--revision", help="Override data.source.revision.")
     parser.add_argument("--manifest-dir", type=Path, help="Override data.manifest.directory.")
     parser.add_argument("--strategy", help="Override the configured fine-tuning strategy.")
@@ -177,6 +183,10 @@ def main() -> None:
     data_config["source"] = source
     if args.image_keys is not None:
         data_config.setdefault("features", {})["image_keys"] = args.image_keys
+    if args.normalize_gripper is not None:
+        embodiment_config = dict(data_config.get("embodiment", {}) or {})
+        embodiment_config["normalize_gripper"] = args.normalize_gripper
+        data_config["embodiment"] = embodiment_config
 
     backend = str(source.get("backend", "huggingface")).lower()
     if backend not in {"huggingface", "local"}:
