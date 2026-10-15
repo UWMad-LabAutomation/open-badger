@@ -92,6 +92,17 @@ class Model(nn.Module, ABC):
     ) -> None:
         """Configure optional model-specific preprocessing from dataset metadata."""
 
+    def optimizer_parameter_groups(self) -> list[dict[str, Any]]:
+        """Return trainable parameters using the default single optimizer group."""
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        return [{"params": parameters}] if parameters else []
+
+    def predict_action_chunk_from_batch(self, batch: Any, **kwargs: Any) -> torch.Tensor:
+        """Predict a VLA action chunk from a raw observation batch."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement VLA action-chunk prediction."
+        )
+
     @abstractmethod
     def build_network(self) -> None:
         """Create and attach the actual model modules."""
@@ -484,9 +495,13 @@ class MolmoAct2(Model):
         batch: Mapping[str, Any],
         **kwargs: Any,
     ) -> torch.Tensor:
-        """Preprocess raw observations and predict a MolmoAct2 action chunk."""
+        """Preprocess raw observations and predict an action chunk."""
         inputs = self.preprocess_observation_batch(batch)
         return self.forward(inputs, **kwargs)
+
+    def optimizer_parameter_groups(self) -> list[dict[str, Any]]:
+        """Use the official LeRobot policy's model-specific optimizer groups."""
+        return self.policy.get_optim_params()
 
     def forward(self, inputs: Mapping[str, Any], **kwargs: Any) -> torch.Tensor:
         """Delegate inference-time action generation to the official policy."""

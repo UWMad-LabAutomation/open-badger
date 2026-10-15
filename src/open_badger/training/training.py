@@ -102,12 +102,12 @@ def build_model(
 
 
 def build_optimizer(model: nn.Module, model_config: Mapping[str, Any]) -> Optimizer:
-    """Build AdamW using MolmoAct2's parameter groups when provided."""
+    """Build the configured AdamW optimizer from model-provided parameter groups."""
     finetuning = model_config.get("finetuning", {}) or {}
     optimizer_config = finetuning.get("optimizer", {}) or {}
-    policy = getattr(model, "policy", None)
-    if policy is not None and callable(getattr(policy, "get_optim_params", None)):
-        parameter_groups = policy.get_optim_params()
+    get_parameter_groups = getattr(model, "optimizer_parameter_groups", None)
+    if callable(get_parameter_groups):
+        parameter_groups = get_parameter_groups()
     else:
         trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         parameter_groups = [{"params": trainable_parameters}]

@@ -274,13 +274,10 @@ def test_load_training_config_supports_strategy_override():
     assert model_config["finetuning"]["selected_strategy"] == "action_expert_only"
 
 
-def test_build_optimizer_uses_policy_parameter_groups():
+def test_build_optimizer_uses_model_parameter_groups():
     model = ToyModel()
-    model.policy = type(
-        "PolicyWithOptimizerGroups",
-        (),
-        {"get_optim_params": lambda _self: [{"params": [model.weight], "lr": 0.03}]},
-    )()
+    model.policy = object()
+    model.optimizer_parameter_groups = lambda: [{"params": [model.weight], "lr": 0.03}]
 
     optimizer = build_optimizer(
         model,

@@ -71,7 +71,7 @@ def _load_or_build_manifest(
     )
 
 
-def _run_smoke_test(model: torch.nn.Module, batches: Any) -> None:
+def _run_vla_smoke_test(model: torch.nn.Module, batches: Any) -> None:
     model.train()
     try:
         batch = next(iter(batches))
@@ -82,40 +82,40 @@ def _run_smoke_test(model: torch.nn.Module, batches: Any) -> None:
         result = model.training_step(batch)
     loss = result.get("loss") if isinstance(result, Mapping) else None
     if not torch.is_tensor(loss) or loss.numel() != 1:
-        raise TypeError("MolmoAct2 smoke test expected training_step() to return a scalar loss.")
+        raise TypeError("VLA smoke test expected training_step() to return a scalar loss.")
     if not bool(torch.isfinite(loss)):
-        raise FloatingPointError("MolmoAct2 smoke-test loss is not finite.")
+        raise FloatingPointError("VLA smoke-test loss is not finite.")
     metrics = result.get("metrics", {})
-    print(f"Forward/loss smoke test passed: loss={loss.detach().float().item():.6f}")
+    print(f"VLA forward/loss smoke test passed: loss={loss.detach().float().item():.6f}")
     if isinstance(metrics, Mapping):
         for name, value in metrics.items():
             if isinstance(value, (int, float)):
                 print(f"  {name}: {value}")
 
 
-def _run_inference_smoke_test(model: torch.nn.Module, batches: Any) -> None:
+def _run_vla_inference_smoke_test(model: torch.nn.Module, batches: Any) -> None:
     predict_from_batch = getattr(model, "predict_action_chunk_from_batch", None)
     if not callable(predict_from_batch):
-        raise TypeError("The selected model does not support raw-batch action prediction.")
+        raise TypeError("VLA models must implement predict_action_chunk_from_batch().")
     model.eval()
     try:
         batch = next(iter(batches))
     except StopIteration as exc:
-        raise ValueError("The inference manifest produced no batches.") from exc
+        raise ValueError("The VLA inference manifest produced no batches.") from exc
 
     with torch.inference_mode():
         actions = predict_from_batch(batch)
     if not torch.is_tensor(actions) or actions.ndim != 3:
         raise TypeError(
-            "Inference smoke test expected an action tensor with shape "
+            "VLA inference smoke test expected an action tensor with shape "
             "[batch, horizon, action_dim]."
         )
     if actions.shape[0] != 1 or actions.shape[1] < 1 or actions.shape[2] < 1:
         raise ValueError(f"Unexpected predicted action chunk shape: {tuple(actions.shape)}.")
     if not bool(torch.isfinite(actions).all()):
-        raise FloatingPointError("MolmoAct2 produced non-finite actions.")
+        raise FloatingPointError("VLA produced non-finite actions.")
     print(
-        "Inference smoke test passed: "
+        "VLA inference smoke test passed: "
         f"action_shape={tuple(actions.shape)}, "
         f"range=[{actions.min().item():.4f}, {actions.max().item():.4f}]"
     )
@@ -161,14 +161,18 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, help="Override training.training.max_steps.")
     smoke_tests = parser.add_mutually_exclusive_group()
     smoke_tests.add_argument(
+        "--vla-smoke-test",
         "--smoke-test",
+        dest="vla_smoke_test",
         action="store_true",
-        help="Run one supervised forward/loss batch without backward or optimizer updates.",
+        help="Run one VLA forward/loss batch without backward or optimizer updates.",
     )
     smoke_tests.add_argument(
+        "--vla-inference-smoke-test",
         "--inference-smoke-test",
+        dest="vla_inference_smoke_test",
         action="store_true",
-        help="Predict one action chunk from a real observation batch.",
+        help="Predict one VLA action chunk from a real observation batch.",
     )
     args = parser.parse_args()
 
@@ -236,7 +240,7 @@ def main() -> None:
         if args.batch_size < 1:
             raise ValueError("--batch-size must be positive.")
         data_config.setdefault("loader", {})["batch_size"] = args.batch_size
-    elif args.smoke_test or args.inference_smoke_test:
+    elif args.vla_smoke_test or args.vla_inference_smoke_test:
         data_config.setdefault("loader", {})["batch_size"] = 1
     if args.num_workers is not None:
         if args.num_workers < 0:
@@ -252,18 +256,18 @@ def main() -> None:
     )
     print(f"Manifest: {manifest_directory} ({len(manifest)} examples)")
 
-    if args.smoke_test:
+    if args.vla_smoke_test:
         from open_badger.training.training import build_training_dataloader
 
-        _run_smoke_test(
+        _run_vla_smoke_test(
             model,
             build_training_dataloader(reader, manifest, data_config),
         )
         return
-    if args.inference_smoke_test:
+    if args.vla_inference_smoke_test:
         from open_badger.training.training import build_training_dataloader
 
-        _run_inference_smoke_test(
+        _run_vla_inference_smoke_test(
             model,
             build_training_dataloader(
                 reader,

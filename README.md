@@ -17,8 +17,9 @@ The current integration focus is supervised fine-tuning with MolmoAct2.
 - The MolmoAct2 adapter uses LeRobot's official preprocessing pipeline for
   normalization, camera/text input preparation, and action formatting.
 - `scripts/train.py` composes the job, model, and data YAML configs. It supports
-  a one-batch supervised forward/loss check (`--smoke-test`) and a one-batch
-  action-prediction check (`--inference-smoke-test`).
+  a one-batch VLA forward/loss check (`--vla-smoke-test`) and a one-batch
+  action-prediction check (`--vla-inference-smoke-test`). The previous
+  `--smoke-test` and `--inference-smoke-test` names remain accepted aliases.
 - `./container.sh` builds and runs the CUDA development image and keeps the
   Hugging Face cache in the repository-mounted `.cache/huggingface` directory.
 
@@ -67,12 +68,13 @@ Then run an action-prediction smoke test:
   --manifest-dir /workspace/open-badger/outputs/manifests/00ri-so100-test-ep0 \
   --batch-size 1 \
   --num-workers 1 \
-  --inference-smoke-test
+  --vla-inference-smoke-test
 ```
 
 The first run downloads the MolmoAct2 checkpoint. Subsequent container runs
-reuse the Hugging Face cache. Use `--smoke-test` instead to run the supervised
-forward pass and loss calculation without backward or optimizer updates.
+reuse the Hugging Face cache. Use `--vla-smoke-test` instead to run the
+supervised forward pass and loss calculation without backward or optimizer
+updates.
 
 ## Configuration
 
