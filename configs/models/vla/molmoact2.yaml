@@ -30,9 +30,6 @@ training:
   validation:
     every_steps: 500
 
-  logging:
-    every_steps: 10
-
 finetuning:
   # The active strategy is selected by the high-level training config.
   # Shared by every fine-tuning strategy.

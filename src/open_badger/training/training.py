@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import warnings
@@ -18,6 +19,7 @@ from open_badger.data.dataset import ManifestTrainingDataset
 from open_badger.data.readers.base import DatasetReader
 from open_badger.data.schema import DatasetMetadata, TrainingExampleRef
 from open_badger.models.registry import Model, ModelRegistry
+from open_badger.logging import MetricLogger
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,24 @@ def load_training_config(
         )
     finetuning["selected_strategy"] = selected_strategy
     model_config["finetuning"] = finetuning
+    job_training = job_config.get("training", {}) or {}
+    if not isinstance(job_training, Mapping):
+        raise TypeError("Training config's training section must be a mapping.")
+    model_training = dict(model_config.get("training", {}) or {})
+    model_logging = dict(model_training.get("logging", {}) or {})
+    job_logging = job_training.get("logging", {}) or {}
+    if not isinstance(job_logging, Mapping):
+        raise TypeError("Training config's training.logging section must be a mapping.")
+    for key, value in job_logging.items():
+        if key in {"tensorboard", "wandb"} and isinstance(value, Mapping):
+            backend_config = dict(model_logging.get(key, {}) or {})
+            backend_config.update(value)
+            model_logging[key] = backend_config
+        else:
+            model_logging[key] = value
+    if job_logging:
+        model_training["logging"] = model_logging
+        model_config["training"] = model_training
     model_config["data"] = data_config
     return model_config, data_config
 
@@ -191,6 +211,8 @@ def train(
     gradient_accumulation_steps: int = 1,
     max_grad_norm: float | None = None,
     device: str | torch.device | None = None,
+    log_every_steps: int = 10,
+    metric_logger: MetricLogger | None = None,
 ) -> TrainingResult:
     """Run optimizer steps over an iterable of already-collated raw batches."""
     if max_steps < 1:
@@ -199,6 +221,8 @@ def train(
         raise ValueError("gradient_accumulation_steps must be positive.")
     if max_grad_norm is not None and max_grad_norm <= 0:
         raise ValueError("max_grad_norm must be positive when provided.")
+    if log_every_steps < 1:
+        raise ValueError("log_every_steps must be positive.")
 
     target_device = (
         torch.device(device)
@@ -211,7 +235,8 @@ def train(
     last_loss = 0.0
     last_metrics: dict[str, float] = {}
 
-    for _ in range(max_steps):
+    for step in range(1, max_steps + 1):
+        step_started = perf_counter()
         accumulated_loss = 0.0
         accumulated_metrics: dict[str, float] = {}
         for _ in range(gradient_accumulation_steps):
@@ -257,6 +282,18 @@ def train(
         optimizer.zero_grad(set_to_none=True)
         last_loss = accumulated_loss
         last_metrics = accumulated_metrics
+        if metric_logger is not None and (
+            step % log_every_steps == 0 or step == max_steps
+        ):
+            logged_metrics = {
+                "train/loss": last_loss,
+                "train/step_time_seconds": perf_counter() - step_started,
+                **{
+                    f"train/{name}": value
+                    for name, value in last_metrics.items()
+                },
+            }
+            metric_logger.log_metrics(logged_metrics, step=step)
 
     return TrainingResult(steps=max_steps, loss=last_loss, metrics=last_metrics)
 
@@ -272,6 +309,8 @@ def train_from_manifest(
     gradient_accumulation_steps: int = 1,
     max_grad_norm: float | None = None,
     device: str | torch.device | None = None,
+    log_every_steps: int = 10,
+    metric_logger: MetricLogger | None = None,
 ) -> TrainingResult:
     """Resolve manifest examples into batches and train on them."""
     if isinstance(model, Model):
@@ -289,6 +328,8 @@ def train_from_manifest(
         gradient_accumulation_steps=gradient_accumulation_steps,
         max_grad_norm=max_grad_norm,
         device=device,
+        log_every_steps=log_every_steps,
+        metric_logger=metric_logger,
     )
 
 

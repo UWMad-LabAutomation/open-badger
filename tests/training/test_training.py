@@ -79,6 +79,36 @@ def test_train_runs_optimizer_steps_with_gradient_accumulation():
     assert model.weight.item() > 0
 
 
+def test_train_logs_metrics_on_interval_and_final_step():
+    class RecordingLogger:
+        def __init__(self):
+            self.events = []
+
+        def log_metrics(self, metrics, *, step):
+            self.events.append((step, dict(metrics)))
+
+        def close(self):
+            pass
+
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    logger = RecordingLogger()
+
+    train(
+        model,
+        [{"input": torch.tensor([1.0]), "target": torch.tensor([1.0])}],
+        optimizer,
+        max_steps=3,
+        log_every_steps=2,
+        metric_logger=logger,
+    )
+
+    assert [step for step, _ in logger.events] == [2, 3]
+    assert all("train/loss" in metrics for _, metrics in logger.events)
+    assert all("train/step_time_seconds" in metrics for _, metrics in logger.events)
+    assert all("train/train_loss" in metrics for _, metrics in logger.events)
+
+
 def test_train_rejects_empty_batches():
     model = ToyModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -230,6 +260,16 @@ def test_train_from_manifest_passes_resolved_action_chunk_to_model():
     model = ChunkModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
+    class RecordingLogger:
+        events = []
+
+        def log_metrics(self, metrics, *, step):
+            self.events.append((step, dict(metrics)))
+
+        def close(self):
+            pass
+
+    logger = RecordingLogger()
     result = train_from_manifest(
         model,
         reader,
@@ -244,10 +284,14 @@ def test_train_from_manifest_passes_resolved_action_chunk_to_model():
             },
         },
         max_steps=1,
+        log_every_steps=1,
+        metric_logger=logger,
     )
 
     assert result.steps == 1
     assert model.action_shape == (1, 2, 2)
+    assert logger.events[0][0] == 1
+    assert "train/loss" in logger.events[0][1]
 
 
 def test_load_training_config_composes_referenced_model_and_data_configs():
@@ -260,6 +304,8 @@ def test_load_training_config_composes_referenced_model_and_data_configs():
     assert model_config["model"]["name"] == "molmoact2"
     assert model_config["finetuning"]["selected_strategy"] == "lora"
     assert model_config["data"]["sampling"]["action_horizon"] == 10
+    assert model_config["training"]["logging"]["every_steps"] == 10
+    assert model_config["training"]["logging"]["tensorboard"]["enabled"] is False
     assert data_config["manifest"]["rebuild"] is False
 
 

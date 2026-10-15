@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from open_badger.data import LeRobotReader, ParquetManifest, SampleManifest
+from open_badger.logging import ExperimentLogger, default_run_name
 from open_badger.training.training import (
     build_model,
     build_optimizer,
@@ -158,7 +159,33 @@ def main() -> None:
     parser.add_argument("--strategy", help="Override the configured fine-tuning strategy.")
     parser.add_argument("--batch-size", type=int, help="Override data.loader.batch_size.")
     parser.add_argument("--num-workers", type=int, help="Override data.loader.num_workers.")
-    parser.add_argument("--max-steps", type=int, help="Override training.training.max_steps.")
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        help="Override training.training.max_steps (optimizer updates, not epochs).",
+    )
+    parser.add_argument("--log-every-steps", type=int, help="Override training.logging.every_steps.")
+    parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable TensorBoard logging.",
+    )
+    parser.add_argument("--tensorboard-dir", type=Path, help="Override TensorBoard log directory.")
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable Weights & Biases logging.",
+    )
+    parser.add_argument("--wandb-project", help="Override the W&B project.")
+    parser.add_argument("--wandb-entity", help="Override the W&B entity.")
+    parser.add_argument("--wandb-run-name", help="Override the W&B run name.")
+    parser.add_argument(
+        "--wandb-mode",
+        choices=("online", "offline"),
+        help="Override W&B logging mode.",
+    )
     smoke_tests = parser.add_mutually_exclusive_group()
     smoke_tests.add_argument(
         "--vla-smoke-test",
@@ -287,19 +314,81 @@ def main() -> None:
         if args.max_steps is not None
         else int(model_training.get("max_steps", 1))
     )
-    result = train_from_manifest(
-        model,
-        reader,
-        manifest,
-        optimizer,
-        data_config=data_config,
-        max_steps=max_steps,
-        gradient_accumulation_steps=int(
-            model_training.get("gradient_accumulation_steps", 1)
-        ),
-        max_grad_norm=optimizer_config.get("grad_clip_norm"),
-        device=model_config.get("runtime", {}).get("device"),
+    logging_config = dict(model_training.get("logging", {}) or {})
+    if args.log_every_steps is not None:
+        logging_config["every_steps"] = args.log_every_steps
+    if args.tensorboard is not None:
+        tensorboard_config = dict(logging_config.get("tensorboard", {}) or {})
+        tensorboard_config["enabled"] = args.tensorboard
+        logging_config["tensorboard"] = tensorboard_config
+    if args.tensorboard_dir is not None:
+        tensorboard_config = dict(logging_config.get("tensorboard", {}) or {})
+        tensorboard_config.update(enabled=True, log_dir=str(args.tensorboard_dir))
+        logging_config["tensorboard"] = tensorboard_config
+    if args.wandb is not None:
+        wandb_config = dict(logging_config.get("wandb", {}) or {})
+        wandb_config["enabled"] = args.wandb
+        logging_config["wandb"] = wandb_config
+    wandb_overrides = {
+        "project": args.wandb_project,
+        "entity": args.wandb_entity,
+        "run_name": args.wandb_run_name,
+        "mode": args.wandb_mode,
+    }
+    if any(value is not None for value in wandb_overrides.values()):
+        wandb_config = dict(logging_config.get("wandb", {}) or {})
+        wandb_config.update(
+            {key: value for key, value in wandb_overrides.items() if value is not None}
+        )
+        wandb_config["enabled"] = True
+        logging_config["wandb"] = wandb_config
+
+    log_every_steps = int(logging_config.get("every_steps", 10))
+    if log_every_steps < 1:
+        raise ValueError("training.logging.every_steps must be positive.")
+    model_name = str(model_config.get("model", {}).get("name", "model"))
+    run_name = default_run_name(model_name, metadata.dataset_id)
+    logger = ExperimentLogger(
+        logging_config,
+        {
+            "model": model_config,
+            "data": data_config,
+            "dataset": {
+                "id": metadata.dataset_id,
+                "revision": metadata.revision,
+                "frames": metadata.total_frames,
+                "episodes": metadata.total_episodes,
+                "manifest_examples": len(manifest),
+            },
+            "training": {
+                "max_steps": max_steps,
+                "gradient_accumulation_steps": int(
+                    model_training.get("gradient_accumulation_steps", 1)
+                ),
+                "batch_size": int(data_config.get("loader", {}).get("batch_size", 1)),
+            },
+        },
+        repository_root=Path(__file__).resolve().parents[1],
+        default_run_name=run_name,
     )
+    try:
+        result = train_from_manifest(
+            model,
+            reader,
+            manifest,
+            optimizer,
+            data_config=data_config,
+            max_steps=max_steps,
+            gradient_accumulation_steps=int(
+                model_training.get("gradient_accumulation_steps", 1)
+            ),
+            max_grad_norm=optimizer_config.get("grad_clip_norm"),
+            device=model_config.get("runtime", {}).get("device"),
+            log_every_steps=log_every_steps,
+            metric_logger=logger,
+        )
+    finally:
+        logger.close()
     print(f"Training complete: steps={result.steps}, loss={result.loss:.6f}")
     for name, value in result.metrics.items():
         print(f"  {name}: {value:.6f}")

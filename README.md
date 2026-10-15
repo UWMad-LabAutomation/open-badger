@@ -76,10 +76,41 @@ reuse the Hugging Face cache. Use `--vla-smoke-test` instead to run the
 supervised forward pass and loss calculation without backward or optimizer
 updates.
 
+## Training metrics and dataset passes
+
+The training loop logs `train/loss`, scalar model metrics, and optimizer-step
+duration to the console every `training.logging.every_steps` updates. TensorBoard
+and Weights & Biases are optional and disabled by default. Enable either from
+the CLI:
+
+```bash
+--tensorboard
+--wandb
+```
+
+TensorBoard events are written under `outputs/tensorboard/<run-name>` by
+default; override the location with `--tensorboard-dir`. To view them, run:
+
+```bash
+./container.sh run tensorboard \
+  --logdir /workspace/open-badger/outputs/tensorboard \
+  --bind_all
+```
+
+For W&B online logging, export `WANDB_API_KEY` on the host before running the
+container. The wrapper forwards it without writing the key to the repository.
+Use `--wandb-mode offline` to save a local W&B run under `outputs/wandb`.
+
+`--max-steps` is the number of optimizer updates; the loader repeats the
+manifest if it is exhausted before that count. With the current 564-example
+manifest, batch size 1, and gradient accumulation 1, `--max-steps 564` consumes
+one full manifest pass. The model YAML's current default is 50,000 steps, so
+set `--max-steps` explicitly for a bounded end-to-end training trial.
+
 ## Configuration
 
 - [`configs/training/train.yaml`](configs/training/train.yaml) selects the model,
-  fine-tuning strategy, and data config.
+  fine-tuning strategy, data config, and shared experiment-logging defaults.
 - [`configs/models/vla/molmoact2.yaml`](configs/models/vla/molmoact2.yaml)
   contains the checkpoint, runtime, action limits, and training settings.
 - [`configs/data/data_reader.yaml`](configs/data/data_reader.yaml) contains the
@@ -93,9 +124,8 @@ episodes, camera keys, gripper normalization, batch size, and worker count.
 - One LeRobot dataset is opened per run; combining datasets is not implemented.
 - Local and Hugging Face sources are supported by the current entry point. S3,
   SageMaker, and CHTC staging/launch workflows are not wired end to end.
-- The training loop supports gradient accumulation and optimizer updates, but
-  checkpoint management, scheduling, experiment logging, and distributed
-  training still need implementation.
+- Checkpoint management, scheduling, validation, and distributed training still
+  need implementation.
 - MolmoAct2 history windows beyond one observation frame are not yet assembled
   by the universal loader.
 

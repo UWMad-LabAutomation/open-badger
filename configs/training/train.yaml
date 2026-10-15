@@ -7,3 +7,17 @@ model:
 
 data:
   config: ../data/data_reader.yaml
+
+training:
+  logging:
+    every_steps: 10
+    console: true
+    tensorboard:
+      enabled: false
+      log_dir: null
+    wandb:
+      enabled: false
+      project: open-badger
+      entity: null
+      run_name: null
+      mode: online
