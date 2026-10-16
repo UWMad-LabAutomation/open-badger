@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import warnings
+import random
 import torch
 from torch import nn
 import yaml
@@ -24,11 +25,19 @@ from open_badger.logging import MetricLogger
 
 @dataclass(frozen=True)
 class TrainingResult:
-    """Summary of the most recent optimizer step."""
+    """Summary of the most recent training update."""
 
     steps: int
     loss: float
     metrics: dict[str, float]
+
+
+def seed_training(seed: int) -> None:
+    """Seed Python and PyTorch RNGs before model construction and data iteration."""
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def load_training_config(
@@ -60,6 +69,7 @@ def load_training_config(
             f"Unknown fine-tuning strategy {selected_strategy!r}; available strategies: {available}."
         )
     finetuning["selected_strategy"] = selected_strategy
+    finetuning["action_expert_only"] = bool(finetuning.get("action_expert_only", False))
     model_config["finetuning"] = finetuning
     job_training = job_config.get("training", {}) or {}
     if not isinstance(job_training, Mapping):
@@ -213,8 +223,11 @@ def train(
     device: str | torch.device | None = None,
     log_every_steps: int = 10,
     metric_logger: MetricLogger | None = None,
+    start_step: int = 0,
+    checkpoint_every_steps: int | None = None,
+    checkpoint_callback: Callable[[int], None] | None = None,
 ) -> TrainingResult:
-    """Run optimizer steps over an iterable of already-collated raw batches."""
+    """Run training updates over an iterable of already-collated raw batches."""
     if max_steps < 1:
         raise ValueError("max_steps must be positive.")
     if gradient_accumulation_steps < 1:
@@ -223,6 +236,10 @@ def train(
         raise ValueError("max_grad_norm must be positive when provided.")
     if log_every_steps < 1:
         raise ValueError("log_every_steps must be positive.")
+    if start_step < 0 or start_step >= max_steps:
+        raise ValueError("start_step must be non-negative and less than max_steps.")
+    if checkpoint_every_steps is not None and checkpoint_every_steps < 1:
+        raise ValueError("checkpoint_every_steps must be positive when provided.")
 
     target_device = (
         torch.device(device)
@@ -230,12 +247,41 @@ def train(
         else getattr(model, "device", None)
     )
     model.train()
+    if start_step:
+        if (
+            int(getattr(batches, "num_workers", 0)) > 1
+            and int(getattr(batches, "batch_size", 1)) > 1
+        ):
+            raise ValueError(
+                "Exact resume-position restoration for iterable loaders requires "
+                "num_workers <= 1 or batch_size == 1."
+            )
+        try:
+            batches_per_epoch = len(batches)  # type: ignore[arg-type]
+        except TypeError as exc:
+            raise TypeError("Resuming training requires a sized batch iterable.") from exc
+        if batches_per_epoch < 1:
+            raise ValueError("Cannot resume from an empty batch iterable.")
+        completed_batches = start_step * gradient_accumulation_steps
+        completed_epochs, skipped_batches = divmod(completed_batches, batches_per_epoch)
+        dataset = getattr(batches, "dataset", None)
+        set_epoch = getattr(dataset, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(completed_epochs)
     batch_iterator = iter(batches)
+    if start_step:
+        for _ in range(skipped_batches):
+            try:
+                next(batch_iterator)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    "Batch iterable ended before the resume position could be restored."
+                ) from exc
     optimizer.zero_grad(set_to_none=True)
     last_loss = 0.0
     last_metrics: dict[str, float] = {}
 
-    for step in range(1, max_steps + 1):
+    for step in range(start_step + 1, max_steps + 1):
         step_started = perf_counter()
         accumulated_loss = 0.0
         accumulated_metrics: dict[str, float] = {}
@@ -287,13 +333,21 @@ def train(
         ):
             logged_metrics = {
                 "train/loss": last_loss,
-                "train/step_time_seconds": perf_counter() - step_started,
+                "train/update_time_seconds": perf_counter() - step_started,
                 **{
                     f"train/{name}": value
                     for name, value in last_metrics.items()
                 },
             }
             metric_logger.log_metrics(logged_metrics, step=step)
+        if checkpoint_callback is not None and (
+            step == max_steps
+            or (
+                checkpoint_every_steps is not None
+                and step % checkpoint_every_steps == 0
+            )
+        ):
+            checkpoint_callback(step)
 
     return TrainingResult(steps=max_steps, loss=last_loss, metrics=last_metrics)
 
@@ -311,6 +365,9 @@ def train_from_manifest(
     device: str | torch.device | None = None,
     log_every_steps: int = 10,
     metric_logger: MetricLogger | None = None,
+    start_step: int = 0,
+    checkpoint_every_steps: int | None = None,
+    checkpoint_callback: Callable[[int], None] | None = None,
 ) -> TrainingResult:
     """Resolve manifest examples into batches and train on them."""
     if isinstance(model, Model):
@@ -330,6 +387,9 @@ def train_from_manifest(
         device=device,
         log_every_steps=log_every_steps,
         metric_logger=metric_logger,
+        start_step=start_step,
+        checkpoint_every_steps=checkpoint_every_steps,
+        checkpoint_callback=checkpoint_callback,
     )
 
 

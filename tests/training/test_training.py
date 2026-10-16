@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 
 import pytest
@@ -13,9 +14,11 @@ from open_badger.training.training import (
     build_optimizer,
     build_training_dataloader,
     load_training_config,
+    seed_training,
     train,
     train_from_manifest,
 )
+from open_badger.training.checkpointing import TrainingCheckpointManager
 
 
 class ToyModel(torch.nn.Module):
@@ -79,6 +82,17 @@ def test_train_runs_optimizer_steps_with_gradient_accumulation():
     assert model.weight.item() > 0
 
 
+def test_seed_training_repeats_python_and_torch_randomness():
+    seed_training(42)
+    expected = (torch.rand(1), random.random())
+
+    seed_training(42)
+    actual = (torch.rand(1), random.random())
+
+    assert torch.equal(expected[0], actual[0])
+    assert expected[1] == actual[1]
+
+
 def test_train_logs_metrics_on_interval_and_final_step():
     class RecordingLogger:
         def __init__(self):
@@ -105,8 +119,88 @@ def test_train_logs_metrics_on_interval_and_final_step():
 
     assert [step for step, _ in logger.events] == [2, 3]
     assert all("train/loss" in metrics for _, metrics in logger.events)
-    assert all("train/step_time_seconds" in metrics for _, metrics in logger.events)
+    assert all("train/update_time_seconds" in metrics for _, metrics in logger.events)
     assert all("train/train_loss" in metrics for _, metrics in logger.events)
+
+
+def test_train_resumes_from_checkpoint_and_saves_final_update(tmp_path):
+    model = ToyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    manager = TrainingCheckpointManager(
+        tmp_path / "run",
+        keep_last_n=2,
+        identity={"strategy": "lora", "dataset_id": "demo/data"},
+    )
+    batches = [{"input": torch.tensor([1.0]), "target": torch.tensor([1.0])}]
+    train(
+        model,
+        batches,
+        optimizer,
+        max_steps=2,
+        checkpoint_every_steps=2,
+        checkpoint_callback=lambda step: manager.save(model, optimizer, step=step),
+    )
+
+    resumed_model = ToyModel()
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), lr=0.1)
+    start_step = manager.load("latest", resumed_model, resumed_optimizer)
+    assert start_step == 2
+    assert resumed_model.weight.item() == pytest.approx(model.weight.item())
+    assert resumed_optimizer.state_dict()["state"]
+
+    result = train(
+        resumed_model,
+        batches,
+        resumed_optimizer,
+        max_steps=3,
+        start_step=start_step,
+        checkpoint_every_steps=2,
+        checkpoint_callback=lambda step: manager.save(
+            resumed_model, resumed_optimizer, step=step
+        ),
+    )
+
+    assert result.steps == 3
+    assert (tmp_path / "run" / "checkpoint-00000003" / "model.safetensors").is_file()
+
+
+def test_resumed_training_continues_at_saved_batch_offset():
+    class RecordingModel(ToyModel):
+        def __init__(self):
+            super().__init__()
+            self.seen_targets = []
+
+        def training_step(self, batch):
+            self.seen_targets.append(float(batch["target"].item()))
+            return super().training_step(batch)
+
+    model = RecordingModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    batches = [
+        {"input": torch.tensor([1.0]), "target": torch.tensor([1.0])},
+        {"input": torch.tensor([2.0]), "target": torch.tensor([2.0])},
+    ]
+
+    train(model, batches, optimizer, max_steps=2, start_step=1)
+
+    assert model.seen_targets == [2.0]
+
+
+def test_train_saves_checkpoint_on_final_update_before_interval():
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    saved_steps = []
+
+    train(
+        model,
+        [{"input": torch.tensor([1.0]), "target": torch.tensor([1.0])}],
+        optimizer,
+        max_steps=1,
+        checkpoint_every_steps=1000,
+        checkpoint_callback=saved_steps.append,
+    )
+
+    assert saved_steps == [1]
 
 
 def test_train_rejects_empty_batches():
@@ -314,10 +408,34 @@ def test_load_training_config_supports_strategy_override():
 
     model_config, _ = load_training_config(
         repository_root / "configs/training/train.yaml",
-        strategy="action_expert_only",
+        strategy="full_finetune",
     )
 
-    assert model_config["finetuning"]["selected_strategy"] == "action_expert_only"
+    assert model_config["finetuning"]["selected_strategy"] == "full_finetune"
+    assert model_config["finetuning"]["action_expert_only"] is False
+
+
+def test_action_expert_only_is_not_a_finetuning_strategy():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(ValueError, match="Unknown fine-tuning strategy"):
+        load_training_config(
+            repository_root / "configs/training/train.yaml",
+            strategy="action_expert_only",
+        )
+
+
+def test_action_expert_only_is_independent_of_full_finetune_method():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    model_config, _ = load_training_config(
+        repository_root / "configs/training/train.yaml",
+        strategy="full_finetune",
+    )
+
+    model_config["finetuning"]["action_expert_only"] = True
+    assert model_config["finetuning"]["selected_strategy"] == "full_finetune"
+    assert model_config["finetuning"]["action_expert_only"] is True
 
 
 def test_build_optimizer_uses_model_parameter_groups():

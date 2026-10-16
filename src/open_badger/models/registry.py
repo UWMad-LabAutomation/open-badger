@@ -97,6 +97,19 @@ class Model(nn.Module, ABC):
         parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
         return [{"params": parameters}] if parameters else []
 
+    def training_checkpoint_artifact(self) -> tuple[str, dict[str, torch.Tensor]]:
+        """Return the model artifact filename and tensors required to resume training."""
+        return "model.safetensors", dict(self.state_dict())
+
+    def load_training_checkpoint_artifact(
+        self,
+        artifact_name: str,
+        tensors: Mapping[str, torch.Tensor],
+    ) -> None:
+        if artifact_name != "model.safetensors":
+            raise ValueError(f"Unsupported model checkpoint artifact: {artifact_name!r}.")
+        self.load_state_dict(dict(tensors), strict=True)
+
     def predict_action_chunk_from_batch(self, batch: Any, **kwargs: Any) -> torch.Tensor:
         """Predict a VLA action chunk from a raw observation batch."""
         raise NotImplementedError(
@@ -207,6 +220,7 @@ class MolmoAct2(Model):
         inference_cfg = self.config.get("inference", {}) or {}
         finetuning_cfg = self.config.get("finetuning", {}) or {}
         strategy_name = str(finetuning_cfg.get("selected_strategy", "lora"))
+        action_expert_only = bool(finetuning_cfg.get("action_expert_only", False))
         strategies = finetuning_cfg.get("strategies", {}) or {}
         strategy_cfg = strategies.get(strategy_name)
         if not isinstance(strategy_cfg, dict):
@@ -216,6 +230,8 @@ class MolmoAct2(Model):
             )
         training_cfg = {key: value for key, value in finetuning_cfg.items() if key != "strategies"}
         training_cfg.update(strategy_cfg)
+        if action_expert_only:
+            training_cfg["train_mode_vlm"] = "freeze"
         data_features_cfg = data_cfg.get("features", {}) or {}
         data_sampling_cfg = data_cfg.get("sampling", {}) or {}
         data_embodiment_cfg = data_cfg.get("embodiment", {}) or {}
@@ -317,7 +333,12 @@ class MolmoAct2(Model):
             freeze_embedding=bool(training_cfg.get("freeze_embedding", True)),
             gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", False)),
             llm_residual_dropout=float(training_cfg.get("llm_residual_dropout", 0.1)),
-            optimizer_lr=float(training_optimizer_cfg.get("learning_rate", 1.0e-5)),
+            optimizer_lr=float(
+                training_optimizer_cfg.get(
+                    "language_learning_rate",
+                    training_optimizer_cfg.get("learning_rate", 1.0e-5),
+                )
+            ),
             optimizer_vit_lr=float(training_optimizer_cfg.get("vision_learning_rate", 5.0e-6)),
             optimizer_connector_lr=float(training_optimizer_cfg.get("connector_learning_rate", 5.0e-6)),
             optimizer_action_expert_lr=float(
@@ -500,8 +521,125 @@ class MolmoAct2(Model):
         return self.forward(inputs, **kwargs)
 
     def optimizer_parameter_groups(self) -> list[dict[str, Any]]:
-        """Use the official LeRobot policy's model-specific optimizer groups."""
-        return self.policy.get_optim_params()
+        """Use LeRobot's groups while honoring Open Badger's configured learning rates."""
+        optimizer_config = (
+            (self.config.get("finetuning", {}) or {}).get("optimizer", {}) or {}
+        )
+        # LeRobot calls the text-transformer bucket "VLM"; vision and connector
+        # parameters are classified into their own groups below.
+        learning_rates = {
+            "language_backbone": float(
+                optimizer_config.get(
+                    "language_learning_rate",
+                    optimizer_config.get("learning_rate", 1.0e-5),
+                )
+            ),
+            "vision": float(optimizer_config.get("vision_learning_rate", 5.0e-6)),
+            "connector": float(optimizer_config.get("connector_learning_rate", 5.0e-6)),
+            "action_expert": float(
+                optimizer_config.get("action_expert_learning_rate", 5.0e-5)
+            ),
+        }
+        parameter_categories: dict[int, str] = {}
+        for name, parameter in self.policy.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if "action_expert" in name:
+                category = "action_expert"
+            elif any(part in name for part in ("image_pooling_2d", "image_projector")):
+                category = "connector"
+            elif any(part in name for part in ("vision", "image_encoder", "vit")):
+                category = "vision"
+            elif any(part in name for part in ("multi_modal_projector", "connector", "mm_projector")):
+                category = "connector"
+            else:
+                category = "language_backbone"
+            parameter_categories[id(parameter)] = category
+
+        groups = self.policy.get_optim_params()
+        grouped_ids: list[int] = []
+        for group in groups:
+            parameters = group.get("params", ())
+            categories = {parameter_categories.get(id(parameter)) for parameter in parameters}
+            if None in categories or len(categories) != 1:
+                raise RuntimeError(
+                    "LeRobot optimizer groups do not align with the trainable MolmoAct2 "
+                    "parameter categories."
+                )
+            category = next(iter(categories))
+            group["lr"] = learning_rates[category]
+            grouped_ids.extend(id(parameter) for parameter in parameters)
+
+        if sorted(grouped_ids) != sorted(parameter_categories):
+            raise RuntimeError(
+                "LeRobot optimizer groups do not include each trainable MolmoAct2 parameter "
+                "exactly once."
+            )
+        return groups
+
+    def training_checkpoint_artifact(self) -> tuple[str, dict[str, torch.Tensor]]:
+        """Save trainable tensors for the selected method and target scope."""
+        finetuning = self.config.get("finetuning", {}) or {}
+        strategy = str(finetuning.get("selected_strategy", "lora"))
+        action_expert_only = bool(finetuning.get("action_expert_only", False))
+        if action_expert_only:
+            artifact_name = "action_expert.safetensors"
+        elif strategy == "lora":
+            artifact_name = "adapter_model.safetensors"
+        elif strategy == "full_finetune":
+            return "model.safetensors", dict(self.state_dict())
+        else:
+            raise ValueError(f"Unsupported MolmoAct2 training strategy: {strategy!r}.")
+
+        trainable_names = {
+            name for name, parameter in self.named_parameters() if parameter.requires_grad
+        }
+        state = self.state_dict()
+        tensors = {name: state[name] for name in trainable_names if name in state}
+        if set(tensors) != trainable_names:
+            missing = sorted(trainable_names.difference(tensors))
+            raise RuntimeError(
+                f"Trainable parameters are missing from the MolmoAct2 state dict: {missing}."
+            )
+        if not tensors:
+            raise RuntimeError(f"MolmoAct2 strategy {strategy!r} has no trainable tensors.")
+        return artifact_name, tensors
+
+    def load_training_checkpoint_artifact(
+        self,
+        artifact_name: str,
+        tensors: Mapping[str, torch.Tensor],
+    ) -> None:
+        expected_name, _ = self.training_checkpoint_artifact()
+        if artifact_name != expected_name:
+            raise ValueError(
+                f"Checkpoint artifact {artifact_name!r} does not match the selected "
+                f"strategy; expected {expected_name!r}."
+            )
+        finetuning = self.config.get("finetuning", {}) or {}
+        strategy = str(finetuning.get("selected_strategy", "lora"))
+        action_expert_only = bool(finetuning.get("action_expert_only", False))
+        if not action_expert_only and strategy == "full_finetune":
+            self.load_state_dict(dict(tensors), strict=True)
+            return
+
+        if strategy not in {"lora", "full_finetune"}:
+            raise ValueError(f"Unsupported MolmoAct2 training strategy: {strategy!r}.")
+        expected_names = {
+            name for name, parameter in self.named_parameters() if parameter.requires_grad
+        }
+        if set(tensors) != expected_names:
+            missing = sorted(expected_names.difference(tensors))
+            unexpected = sorted(set(tensors).difference(expected_names))
+            raise ValueError(
+                "Checkpoint trainable parameter set does not match this model "
+                f"(missing={missing}, unexpected={unexpected})."
+            )
+        incompatible = self.load_state_dict(dict(tensors), strict=False)
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                f"Checkpoint contains unexpected model tensors: {incompatible.unexpected_keys}."
+            )
 
     def forward(self, inputs: Mapping[str, Any], **kwargs: Any) -> torch.Tensor:
         """Delegate inference-time action generation to the official policy."""

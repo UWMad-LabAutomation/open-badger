@@ -50,11 +50,11 @@ class FakeLeRobotDataset:
 
 
 def test_ensure_quantile_stats_computes_selected_raw_features(monkeypatch):
-    import lerobot.datasets
+    from open_badger.data import preparation
 
     writes = []
     monkeypatch.setattr(
-        lerobot.datasets,
+        preparation,
         "write_stats",
         lambda stats, root: writes.append((stats, root)),
     )
@@ -72,10 +72,10 @@ def test_ensure_quantile_stats_computes_selected_raw_features(monkeypatch):
 
 
 def test_ensure_quantile_stats_skips_complete_stats(monkeypatch):
-    import lerobot.datasets
+    from open_badger.data import preparation
 
     monkeypatch.setattr(
-        lerobot.datasets,
+        preparation,
         "write_stats",
         lambda *_args: pytest.fail("Complete quantile stats must not be rewritten."),
     )

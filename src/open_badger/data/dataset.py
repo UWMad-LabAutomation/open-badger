@@ -56,6 +56,11 @@ class ManifestTrainingDataset(IterableDataset):
         except TypeError as exc:
             raise TypeError("The manifest must provide a length.") from exc
 
+    def set_epoch(self, epoch: int) -> None:
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative.")
+        self._epoch = epoch
+
     def __iter__(self) -> Iterator[dict[str, Any]]:
         worker = get_worker_info()
         worker_id = 0 if worker is None else worker.id

@@ -23,6 +23,7 @@ training:
   seed: 42
 
   checkpointing:
+    directory: outputs/checkpoints
     save_every_steps: 1000
     keep_last_n: 3
     resume_from: null
@@ -51,8 +52,11 @@ finetuning:
     dropout: 0.05
     bias: none
 
+  # Only targets action-expert flow-matching layers.
+  action_expert_only: false
+
   optimizer:
-    learning_rate: 1.0e-5
+    language_learning_rate: 1.0e-5
     vision_learning_rate: 5.0e-6
     connector_learning_rate: 5.0e-6
     action_expert_learning_rate: 5.0e-5
@@ -75,10 +79,6 @@ finetuning:
     full_finetune:
       train_mode_vlm: fft
       gradient_checkpointing: true
-
-    action_expert_only:
-      train_mode_vlm: freeze
-      gradient_checkpointing: false
 
 inference:
   inference_action_mode: continuous

@@ -66,7 +66,7 @@ class ExperimentLogger:
     def log_metrics(self, metrics: Mapping[str, float], *, step: int) -> None:
         if self.console:
             values = " ".join(f"{name}={value:.6g}" for name, value in metrics.items())
-            print(f"step={step} {values}", flush=True)
+            print(f"update={step} {values}", flush=True)
         if self.writer is not None:
             for name, value in metrics.items():
                 self.writer.add_scalar(name, value, global_step=step)

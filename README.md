@@ -101,11 +101,49 @@ For W&B online logging, export `WANDB_API_KEY` on the host before running the
 container. The wrapper forwards it without writing the key to the repository.
 Use `--wandb-mode offline` to save a local W&B run under `outputs/wandb`.
 
-`--max-steps` is the number of optimizer updates; the loader repeats the
+`--max-updates` (also available as `--max-steps`) is the target number of
+training updates; the loader repeats the
 manifest if it is exhausted before that count. With the current 564-example
-manifest, batch size 1, and gradient accumulation 1, `--max-steps 564` consumes
-one full manifest pass. The model YAML's current default is 50,000 steps, so
-set `--max-steps` explicitly for a bounded end-to-end training trial.
+manifest, batch size 1, and gradient accumulation 1, `--max-updates 564` consumes
+one full manifest pass. The model YAML's current default is 50,000 updates, so
+set the update limit explicitly for a bounded end-to-end training trial.
+
+Training saves a checkpoint every `training.checkpointing.save_every_steps`
+training updates and at the end of the run. By default, checkpoints are written under
+`outputs/checkpoints/<model>/<dataset>/<strategy>`; `--checkpoint-dir` overrides
+the root. Full fine-tuning writes `model.safetensors`; LoRA writes
+`adapter_model.safetensors` containing the trainable adapters and action expert;
+action-expert-only writes `action_expert.safetensors`. Each checkpoint also
+contains optimizer/RNG state for resuming and a metadata file identifying the
+model strategy and dataset revision. These are Open Badger resume artifacts,
+not yet a standalone PEFT deployment bundle. Only the newest
+`training.checkpointing.keep_last_n` checkpoints are retained.
+
+Resume from the latest checkpoint in that run directory with
+`--resume-from latest`, or pass a specific checkpoint directory. When resuming,
+the update limit is still the target total, not the number of additional
+training updates. To restore the exact position in the current iterable
+manifest loader, resume with at most one data-loader worker or use batch size 1;
+other multi-worker, multi-example batches are rejected rather than silently
+replaying the wrong part of the manifest.
+
+## MolmoAct2 fine-tuning strategies
+
+`--strategy lora` versus `--strategy full_finetune` selects the VLM/backbone
+fine-tuning method. Independently, `--action-expert-only` restricts training to
+the action expert, regardless of the selected method. Without that modifier:
+
+- `lora` trains LoRA adapters on transformer and vision-backbone target layers,
+  plus the action expert.
+- `full_finetune` trains the model parameters, including the vision backbone.
+  The current `freeze_embedding: true` setting keeps input embeddings frozen.
+
+There is not currently a "train all except the vision encoder" option. LeRobot's
+LoRA optimizer groups previously supplied hard-coded rates for some groups;
+its `vlm_params` bucket is the language transformer, not the vision encoder.
+Open Badger keeps those groups distinct and applies
+`language_learning_rate`, `vision_learning_rate`, `connector_learning_rate`,
+and `action_expert_learning_rate` to the corresponding parameters.
 
 ## Configuration
 
@@ -124,8 +162,14 @@ episodes, camera keys, gripper normalization, batch size, and worker count.
 - One LeRobot dataset is opened per run; combining datasets is not implemented.
 - Local and Hugging Face sources are supported by the current entry point. S3,
   SageMaker, and CHTC staging/launch workflows are not wired end to end.
-- Checkpoint management, scheduling, validation, and distributed training still
-  need implementation.
+- The generic loop currently uses a constant learning rate and has no
+  validation or distributed-training path. `finetuning.scheduler`,
+  `training.validation`, and `training.mixed_precision` are not consumed;
+  `runtime.dtype` sets the model dtype, but the loop does not add an AMP
+  autocast/scaler context.
+- `runtime.backend`, `runtime.requires_grad`, and the `optimization` block are
+  placeholders and do not affect execution. Trainable parameters are selected
+  by the model's fine-tuning strategy.
 - MolmoAct2 history windows beyond one observation frame are not yet assembled
   by the universal loader.
 

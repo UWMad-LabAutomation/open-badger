@@ -12,10 +12,12 @@ import torch
 
 from open_badger.data import LeRobotReader, ParquetManifest, SampleManifest
 from open_badger.logging import ExperimentLogger, default_run_name
+from open_badger.training.checkpointing import TrainingCheckpointManager
 from open_badger.training.training import (
     build_model,
     build_optimizer,
     load_training_config,
+    seed_training,
     train_from_manifest,
 )
 
@@ -122,7 +124,19 @@ def _run_vla_inference_smoke_test(model: torch.nn.Module, batches: Any) -> None:
     )
 
 
-def main() -> None:
+def _print_parameter_summary(model: torch.nn.Module) -> None:
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    percentage = 0.0 if total == 0 else 100.0 * trainable / total
+    print(
+        f"Trainable parameters: {trainable:,} / {total:,} "
+        f"({percentage:.3f}%)"
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config",
@@ -157,12 +171,29 @@ def main() -> None:
     parser.add_argument("--revision", help="Override data.source.revision.")
     parser.add_argument("--manifest-dir", type=Path, help="Override data.manifest.directory.")
     parser.add_argument("--strategy", help="Override the configured fine-tuning strategy.")
+    parser.add_argument(
+        "--action-expert-only",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Train only action-expert parameters alongside the selected fine-tuning method.",
+    )
     parser.add_argument("--batch-size", type=int, help="Override data.loader.batch_size.")
     parser.add_argument("--num-workers", type=int, help="Override data.loader.num_workers.")
     parser.add_argument(
+        "--max-updates",
         "--max-steps",
+        dest="max_steps",
         type=int,
-        help="Override training.training.max_steps (optimizer updates, not epochs).",
+        help="Target total number of training updates (not epochs).",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        help="Override the root directory for local strategy-specific checkpoints.",
+    )
+    parser.add_argument(
+        "--resume-from",
+        help="Resume from a checkpoint directory or the latest checkpoint.",
     )
     parser.add_argument("--log-every-steps", type=int, help="Override training.logging.every_steps.")
     parser.add_argument(
@@ -201,9 +232,21 @@ def main() -> None:
         action="store_true",
         help="Predict one VLA action chunk from a real observation batch.",
     )
-    args = parser.parse_args()
+    return parser
 
+
+def _prepare_training_data(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any], LeRobotReader, Any, ParquetManifest, Path]:
     model_config, data_config = load_training_config(args.config, strategy=args.strategy)
+    model_training = model_config.get("training", {}) or {}
+    seed = model_training.get("seed")
+    if seed is not None:
+        seed_training(int(seed))
+    finetuning_config = dict(model_config.get("finetuning", {}) or {})
+    if args.action_expert_only is not None:
+        finetuning_config["action_expert_only"] = args.action_expert_only
+    model_config["finetuning"] = finetuning_config
     source = dict(data_config.get("source", {}) or {})
     if args.backend is not None:
         source["backend"] = args.backend
@@ -253,16 +296,11 @@ def main() -> None:
             "The manifest contains no valid training examples. Check action horizon, "
             "episode lengths, and action spacing."
         )
-
     model_config["data"] = data_config
-    model = build_model(
-        model_config,
-        dataset_metadata=metadata,
-        native_metadata=reader.dataset.meta,
-    )
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError("The model registry must return a torch.nn.Module.")
+    return model_config, data_config, reader, metadata, manifest, manifest_directory
 
+
+def _apply_loader_overrides(args: argparse.Namespace, data_config: dict[str, Any]) -> None:
     if args.batch_size is not None:
         if args.batch_size < 1:
             raise ValueError("--batch-size must be positive.")
@@ -277,43 +315,113 @@ def main() -> None:
         if args.num_workers == 0:
             loader_config["persistent_workers"] = False
 
-    print(
-        f"Dataset: {metadata.dataset_id} @ {metadata.revision}; "
-        f"{metadata.total_frames} frames, {metadata.total_episodes} episodes"
-    )
-    print(f"Manifest: {manifest_directory} ({len(manifest)} examples)")
 
-    if args.vla_smoke_test:
-        from open_badger.training.training import build_training_dataloader
-
-        _run_vla_smoke_test(
-            model,
-            build_training_dataloader(reader, manifest, data_config),
-        )
-        return
-    if args.vla_inference_smoke_test:
-        from open_badger.training.training import build_training_dataloader
-
-        _run_vla_inference_smoke_test(
-            model,
-            build_training_dataloader(
-                reader,
-                manifest,
-                data_config,
-                include_action=False,
-            ),
-        )
-        return
-
-    optimizer = build_optimizer(model, model_config)
+def _prepare_checkpointing(
+    args: argparse.Namespace,
+    model_config: Mapping[str, Any],
+    data_config: Mapping[str, Any],
+    metadata: Any,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    max_updates: int,
+) -> tuple[TrainingCheckpointManager, int, int]:
     model_training = model_config.get("training", {}) or {}
+    checkpointing_config = dict(model_training.get("checkpointing", {}) or {})
+    save_every_steps = int(checkpointing_config.get("save_every_steps", 1000))
+    keep_last_n = int(checkpointing_config.get("keep_last_n", 3))
+    if save_every_steps < 1:
+        raise ValueError("training.checkpointing.save_every_steps must be positive.")
+    if keep_last_n < 1:
+        raise ValueError("training.checkpointing.keep_last_n must be positive.")
+
+    repository_root = Path(__file__).resolve().parents[1]
+    model_section = model_config.get("model", {}) or {}
+    model_name = str(model_section.get("name", "model"))
+    checkpoint_root = Path(
+        args.checkpoint_dir
+        or checkpointing_config.get("directory")
+        or "outputs/checkpoints"
+    ).expanduser()
+    if not checkpoint_root.is_absolute():
+        checkpoint_root = repository_root / checkpoint_root
+
     finetuning = model_config.get("finetuning", {}) or {}
-    optimizer_config = finetuning.get("optimizer", {}) or {}
-    max_steps = (
-        args.max_steps
-        if args.max_steps is not None
-        else int(model_training.get("max_steps", 1))
+    strategy_method = str(finetuning.get("selected_strategy", "lora"))
+    action_expert_only = bool(finetuning.get("action_expert_only", False))
+    strategy_name = (
+        f"{strategy_method}-action-expert-only" if action_expert_only else strategy_method
     )
+    model_checkpoint_config = model_section.get("checkpoint", {}) or {}
+    action_feature = metadata.action_feature
+    inferred_action_dim = (
+        action_feature.shape[-1] if action_feature is not None and action_feature.shape else 0
+    )
+    checkpoint_action_dim = int(
+        data_config.get("features", {}).get("action_dim") or inferred_action_dim
+    )
+    if checkpoint_action_dim < 1:
+        raise ValueError("Cannot create a training checkpoint without a known action dimension.")
+
+    checkpoint_directory = (
+        checkpoint_root
+        / re.sub(r"[^A-Za-z0-9._-]+", "_", model_name)
+        / re.sub(r"[^A-Za-z0-9._-]+", "_", metadata.dataset_id)
+        / re.sub(r"[^A-Za-z0-9._-]+", "_", strategy_name)
+    )
+    checkpoint_manager = TrainingCheckpointManager(
+        checkpoint_directory,
+        keep_last_n=keep_last_n,
+        identity={
+            "model": model_name,
+            "strategy": strategy_name,
+            "dataset_id": metadata.dataset_id,
+            "revision": metadata.revision,
+            "base_model": str(model_checkpoint_config.get("repo_id", "")),
+            "base_revision": str(model_checkpoint_config.get("revision") or ""),
+            "action_horizon": int(data_config.get("sampling", {}).get("action_horizon", 1)),
+            "action_dim": checkpoint_action_dim,
+            "image_keys": list(data_config.get("features", {}).get("image_keys", ())),
+            "batch_size": int(data_config.get("loader", {}).get("batch_size", 1)),
+            "num_workers": int(data_config.get("loader", {}).get("num_workers", 0)),
+            "gradient_accumulation_steps": int(
+                model_training.get("gradient_accumulation_steps", 1)
+            ),
+            "seed": model_training.get("seed"),
+            "sampling": dict(data_config.get("sampling", {}) or {}),
+            "finetuning": finetuning,
+        },
+    )
+    resume_from = (
+        args.resume_from
+        if args.resume_from is not None
+        else checkpointing_config.get("resume_from")
+    )
+    start_update = (
+        checkpoint_manager.load(resume_from, model, optimizer)
+        if resume_from
+        else 0
+    )
+    if start_update >= max_updates:
+        raise ValueError(
+            f"Checkpoint is already at update {start_update}; set --max-updates higher "
+            "to continue training."
+        )
+    return checkpoint_manager, start_update, save_every_steps
+
+
+def _create_training_logger(
+    args: argparse.Namespace,
+    model_config: Mapping[str, Any],
+    data_config: Mapping[str, Any],
+    metadata: Any,
+    manifest: ParquetManifest,
+    *,
+    model_name: str,
+    max_updates: int,
+    start_update: int,
+) -> tuple[ExperimentLogger, int]:
+    model_training = model_config.get("training", {}) or {}
     logging_config = dict(model_training.get("logging", {}) or {})
     if args.log_every_steps is not None:
         logging_config["every_steps"] = args.log_every_steps
@@ -346,7 +454,6 @@ def main() -> None:
     log_every_steps = int(logging_config.get("every_steps", 10))
     if log_every_steps < 1:
         raise ValueError("training.logging.every_steps must be positive.")
-    model_name = str(model_config.get("model", {}).get("name", "model"))
     run_name = default_run_name(model_name, metadata.dataset_id)
     logger = ExperimentLogger(
         logging_config,
@@ -361,7 +468,8 @@ def main() -> None:
                 "manifest_examples": len(manifest),
             },
             "training": {
-                "max_steps": max_steps,
+                "max_updates": max_updates,
+                "start_update": start_update,
                 "gradient_accumulation_steps": int(
                     model_training.get("gradient_accumulation_steps", 1)
                 ),
@@ -371,6 +479,49 @@ def main() -> None:
         repository_root=Path(__file__).resolve().parents[1],
         default_run_name=run_name,
     )
+    return logger, log_every_steps
+
+
+def _run_training(
+    args: argparse.Namespace,
+    model_config: Mapping[str, Any],
+    data_config: Mapping[str, Any],
+    reader: LeRobotReader,
+    metadata: Any,
+    manifest: ParquetManifest,
+    model: torch.nn.Module,
+) -> None:
+    model_training = model_config.get("training", {}) or {}
+    optimizer_config = (model_config.get("finetuning", {}) or {}).get("optimizer", {}) or {}
+    optimizer = build_optimizer(model, model_config)
+    max_updates = (
+        args.max_steps
+        if args.max_steps is not None
+        else int(model_training.get("max_steps", 1))
+    )
+    if max_updates < 1:
+        raise ValueError("training.max_steps must be positive.")
+
+    model_name = str((model_config.get("model", {}) or {}).get("name", "model"))
+    checkpoint_manager, start_update, save_every_steps = _prepare_checkpointing(
+        args,
+        model_config,
+        data_config,
+        metadata,
+        model,
+        optimizer,
+        max_updates=max_updates,
+    )
+    logger, log_every_steps = _create_training_logger(
+        args,
+        model_config,
+        data_config,
+        metadata,
+        manifest,
+        model_name=model_name,
+        max_updates=max_updates,
+        start_update=start_update,
+    )
     try:
         result = train_from_manifest(
             model,
@@ -378,7 +529,7 @@ def main() -> None:
             manifest,
             optimizer,
             data_config=data_config,
-            max_steps=max_steps,
+            max_steps=max_updates,
             gradient_accumulation_steps=int(
                 model_training.get("gradient_accumulation_steps", 1)
             ),
@@ -386,12 +537,76 @@ def main() -> None:
             device=model_config.get("runtime", {}).get("device"),
             log_every_steps=log_every_steps,
             metric_logger=logger,
+            start_step=start_update,
+            checkpoint_every_steps=save_every_steps,
+            checkpoint_callback=lambda update: checkpoint_manager.save(
+                model, optimizer, step=update
+            ),
         )
     finally:
         logger.close()
-    print(f"Training complete: steps={result.steps}, loss={result.loss:.6f}")
+    print(f"Training complete: updates={result.steps}, loss={result.loss:.6f}")
     for name, value in result.metrics.items():
         print(f"  {name}: {value:.6f}")
+
+
+def main() -> None:
+    args = _build_parser().parse_args()
+    (
+        model_config,
+        data_config,
+        reader,
+        metadata,
+        manifest,
+        manifest_directory,
+    ) = _prepare_training_data(args)
+    _apply_loader_overrides(args, data_config)
+    model = build_model(
+        model_config,
+        dataset_metadata=metadata,
+        native_metadata=reader.dataset.meta,
+    )
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("The model registry must return a torch.nn.Module.")
+
+    print(
+        f"Dataset: {metadata.dataset_id} @ {metadata.revision}; "
+        f"{metadata.total_frames} frames, {metadata.total_episodes} episodes"
+    )
+    print(f"Manifest: {manifest_directory} ({len(manifest)} examples)")
+    _print_parameter_summary(model)
+
+    if args.vla_smoke_test:
+        from open_badger.training.training import build_training_dataloader
+
+        _run_vla_smoke_test(
+            model,
+            build_training_dataloader(reader, manifest, data_config),
+        )
+        return
+    if args.vla_inference_smoke_test:
+        from open_badger.training.training import build_training_dataloader
+
+        _run_vla_inference_smoke_test(
+            model,
+            build_training_dataloader(
+                reader,
+                manifest,
+                data_config,
+                include_action=False,
+            ),
+        )
+        return
+
+    _run_training(
+        args,
+        model_config,
+        data_config,
+        reader,
+        metadata,
+        manifest,
+        model,
+    )
 
 
 if __name__ == "__main__":
