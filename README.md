@@ -138,6 +138,9 @@ the action expert, regardless of the selected method. Without that modifier:
 - `full_finetune` trains the model parameters, including the vision backbone.
   The current `freeze_embedding: true` setting keeps input embeddings frozen.
 
+Use `--gradient-checkpointing` or `--no-gradient-checkpointing` to override the
+selected method's configured activation-checkpointing setting for a run.
+
 There is not currently a "train all except the vision encoder" option. LeRobot's
 LoRA optimizer groups previously supplied hard-coded rates for some groups;
 its `vlm_params` bucket is the language transformer, not the vision encoder.

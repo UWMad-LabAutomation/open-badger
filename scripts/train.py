@@ -177,6 +177,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Train only action-expert parameters alongside the selected fine-tuning method.",
     )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override gradient checkpointing for the selected fine-tuning method.",
+    )
     parser.add_argument("--batch-size", type=int, help="Override data.loader.batch_size.")
     parser.add_argument("--num-workers", type=int, help="Override data.loader.num_workers.")
     parser.add_argument(
@@ -235,10 +241,27 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_gradient_checkpointing_override(
+    model_config: dict[str, Any],
+    enabled: bool | None,
+) -> None:
+    if enabled is None:
+        return
+    finetuning = dict(model_config.get("finetuning", {}) or {})
+    strategy = str(finetuning.get("selected_strategy", "lora"))
+    strategies = dict(finetuning.get("strategies", {}) or {})
+    strategy_config = dict(strategies[strategy])
+    strategy_config["gradient_checkpointing"] = enabled
+    strategies[strategy] = strategy_config
+    finetuning["strategies"] = strategies
+    model_config["finetuning"] = finetuning
+
+
 def _prepare_training_data(
     args: argparse.Namespace,
 ) -> tuple[dict[str, Any], dict[str, Any], LeRobotReader, Any, ParquetManifest, Path]:
     model_config, data_config = load_training_config(args.config, strategy=args.strategy)
+    _apply_gradient_checkpointing_override(model_config, args.gradient_checkpointing)
     model_training = model_config.get("training", {}) or {}
     seed = model_training.get("seed")
     if seed is not None:

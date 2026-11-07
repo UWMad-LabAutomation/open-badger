@@ -19,6 +19,7 @@ from open_badger.training.training import (
     train_from_manifest,
 )
 from open_badger.training.checkpointing import TrainingCheckpointManager
+from scripts.train import _apply_gradient_checkpointing_override, _build_parser
 
 
 class ToyModel(torch.nn.Module):
@@ -436,6 +437,25 @@ def test_action_expert_only_is_independent_of_full_finetune_method():
     model_config["finetuning"]["action_expert_only"] = True
     assert model_config["finetuning"]["selected_strategy"] == "full_finetune"
     assert model_config["finetuning"]["action_expert_only"] is True
+
+
+def test_gradient_checkpointing_cli_override_targets_selected_strategy():
+    model_config, _ = load_training_config(
+        Path(__file__).resolve().parents[2] / "configs/training/train.yaml",
+        strategy="lora",
+    )
+
+    _apply_gradient_checkpointing_override(model_config, True)
+
+    assert model_config["finetuning"]["strategies"]["lora"]["gradient_checkpointing"] is True
+    assert model_config["finetuning"]["strategies"]["full_finetune"]["gradient_checkpointing"] is True
+
+
+def test_gradient_checkpointing_cli_flag_supports_on_and_off():
+    parser = _build_parser()
+
+    assert parser.parse_args(["--gradient-checkpointing"]).gradient_checkpointing is True
+    assert parser.parse_args(["--no-gradient-checkpointing"]).gradient_checkpointing is False
 
 
 def test_build_optimizer_uses_model_parameter_groups():
