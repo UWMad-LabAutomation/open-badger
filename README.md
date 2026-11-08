@@ -190,3 +190,11 @@ src/open_badger/
 tests/                   Data, model, and training contract tests
 tools/docker/            CUDA development container
 ```
+
+## Data collection
+
+The pinned `Msuri27/yam-abc-reproduce` fork provides single-arm leader/follower
+recording, a collection GUI, camera discovery, and LeRobot v3 conversion through
+`scripts/collect.py`. It uses a separate Python environment from training.
+See [collection setup and commands](docs/collection.md), including single-arm hardware recording
+and the current limits on drivetrain/spine capture.

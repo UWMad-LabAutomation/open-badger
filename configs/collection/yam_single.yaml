@@ -1,0 +1,19 @@
+# Single-arm hardware starting point from matt/single-arm-dev.
+# Verify CAN channels and gripper type on the collection station before use.
+robot:
+  type: yam
+  arm_name: left
+  arm_type: yam
+  num_arm_joints: 6
+  leader_gripper_type: yam_teaching_handle
+  bilateral_kp: 0.0
+  robots:
+    - {type: yam_left, gripper: linear_4310, channel: can0}
+  controllers:
+    - {type: yam_lead_left, controls: yam_left, channel: can1}
+# Add cameras with station-specific serials; do not reuse another station's serials.
+cameras: []
+control_hz: 30.0
+save_root: outputs/collection/episodes
+task_name: unknown
+data_format: default

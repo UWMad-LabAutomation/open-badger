@@ -17,3 +17,6 @@ wandb/
 build/
 dist/
 *.whl
+
+# Pinned external collection checkout; provenance is tracked in its lock JSON.
+/third_party/yam-abc-reproduce/
