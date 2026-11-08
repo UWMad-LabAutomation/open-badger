@@ -14,6 +14,8 @@ from typing import Any
 import torch
 from torch import nn
 
+from open_badger.data.schema import DatasetMetadata
+
 
 class Model(nn.Module, ABC):
     """Base class shared by all PyTorch policy implementations.
@@ -76,6 +78,43 @@ class Model(nn.Module, ABC):
     @property
     def name(self) -> str:
         return self.model_name
+
+    @property
+    def preprocessor_handles_device(self) -> bool:
+        """Whether batch preprocessing also places model inputs on the device."""
+        return False
+
+    def configure_dataset(
+        self,
+        metadata: DatasetMetadata,
+        *,
+        native_metadata: Any | None = None,
+    ) -> None:
+        """Configure optional model-specific preprocessing from dataset metadata."""
+
+    def optimizer_parameter_groups(self) -> list[dict[str, Any]]:
+        """Return trainable parameters using the default single optimizer group."""
+        parameters = [parameter for parameter in self.parameters() if parameter.requires_grad]
+        return [{"params": parameters}] if parameters else []
+
+    def training_checkpoint_artifact(self) -> tuple[str, dict[str, torch.Tensor]]:
+        """Return the model artifact filename and tensors required to resume training."""
+        return "model.safetensors", dict(self.state_dict())
+
+    def load_training_checkpoint_artifact(
+        self,
+        artifact_name: str,
+        tensors: Mapping[str, torch.Tensor],
+    ) -> None:
+        if artifact_name != "model.safetensors":
+            raise ValueError(f"Unsupported model checkpoint artifact: {artifact_name!r}.")
+        self.load_state_dict(dict(tensors), strict=True)
+
+    def predict_action_chunk_from_batch(self, batch: Any, **kwargs: Any) -> torch.Tensor:
+        """Predict a VLA action chunk from a raw observation batch."""
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement VLA action-chunk prediction."
+        )
 
     @abstractmethod
     def build_network(self) -> None:
@@ -165,7 +204,7 @@ class MolmoAct2(Model):
 
     def build_network(self) -> None:
         try:
-            from lerobot.configs import FeatureType, PolicyFeature
+            from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
             from lerobot.policies.molmoact2.configuration_molmoact2 import MolmoAct2Config
             from lerobot.policies.molmoact2.modeling_molmoact2 import MolmoAct2Policy
         except ImportError as exc:
@@ -175,46 +214,77 @@ class MolmoAct2(Model):
             ) from exc
 
         model_cfg = self.config.get("model", self.config) or {}
+        data_cfg = self.config.get("data", {}) or {}
         checkpoint_cfg = model_cfg.get("checkpoint", {}) or {}
         runtime_cfg = self.config.get("runtime", {}) or {}
         inference_cfg = self.config.get("inference", {}) or {}
-        training_cfg = self.config.get("training", {}) or {}
+        finetuning_cfg = self.config.get("finetuning", {}) or {}
+        strategy_name = str(finetuning_cfg.get("selected_strategy", "lora"))
+        action_expert_only = bool(finetuning_cfg.get("action_expert_only", False))
+        strategies = finetuning_cfg.get("strategies", {}) or {}
+        strategy_cfg = strategies.get(strategy_name)
+        if not isinstance(strategy_cfg, dict):
+            raise KeyError(
+                f"Unknown MolmoAct2 fine-tuning strategy {strategy_name!r}. "
+                f"Available strategies: {', '.join(sorted(strategies)) or 'none'}."
+            )
+        training_cfg = {key: value for key, value in finetuning_cfg.items() if key != "strategies"}
+        training_cfg.update(strategy_cfg)
+        if action_expert_only:
+            training_cfg["train_mode_vlm"] = "freeze"
+        data_features_cfg = data_cfg.get("features", {}) or {}
+        data_sampling_cfg = data_cfg.get("sampling", {}) or {}
+        data_embodiment_cfg = data_cfg.get("embodiment", {}) or {}
+        data_text_cfg = data_cfg.get("text", {}) or {}
 
         repo_id = checkpoint_cfg.get("repo_id", "allenai/MolmoAct2")
         revision = checkpoint_cfg.get("revision")
+        training_lora_cfg = training_cfg.get("lora", {}) or {}
+        training_optimizer_cfg = training_cfg.get("optimizer", {}) or {}
+        training_scheduler_cfg = training_cfg.get("scheduler", {}) or {}
+        normalization_cfg = data_cfg.get("normalization", {}) or {}
+
+        normalization_mapping = {
+            "VISUAL": NormalizationMode[str(normalization_cfg.get("visual", "identity")).upper()],
+            "STATE": NormalizationMode[str(normalization_cfg.get("state", "quantiles")).upper()],
+            "ACTION": NormalizationMode[str(normalization_cfg.get("action", "quantiles")).upper()],
+        }
+
         self.norm_tag = inference_cfg.get("norm_tag")
         self.action_mode = training_cfg.get("action_mode", "continuous")
-        self.image_keys = list(inference_cfg.get("image_keys") or [])
+        self.image_keys = list(data_features_cfg.get("image_keys") or [])
         if not self.image_keys:
             raise ValueError(
-                "MolmoAct2 requires inference.image_keys so the official LeRobot "
+                "MolmoAct2 requires data.features.image_keys so the official LeRobot "
                 "policy can build its visual input features."
             )
         self.n_action_steps = inference_cfg.get("n_action_steps")
         self.num_flow_matching_steps = int(
             training_cfg.get("flow_matching_steps", inference_cfg.get("flow_matching_steps", 8))
         )
-        self.action_dim = int(inference_cfg.get("action_dim", model_cfg.get("max_action_dim", 32)))
-        self.action_horizon = int(inference_cfg.get("action_horizon", 1))
+        self.action_dim = int(data_features_cfg.get("action_dim") or model_cfg.get("max_action_dim", 32))
+        self.max_action_dim = int(model_cfg.get("max_action_dim", 32))
+        self.action_horizon = int(data_sampling_cfg.get("action_horizon", 1))
         max_action_horizon = int(
             model_cfg.get("max_action_horizon", 30)
         )
         if self.action_horizon < 1 or self.action_horizon > max_action_horizon:
             raise ValueError(
-                "`inference.action_horizon` must be between 1 and the checkpoint "
+                "`data.sampling.action_horizon` must be between 1 and the checkpoint "
                 f"maximum ({max_action_horizon}), got {self.action_horizon}."
             )
         if self.n_action_steps is None:
             self.n_action_steps = self.action_horizon
         if int(self.n_action_steps) > self.action_horizon:
             raise ValueError(
-                "`inference.n_action_steps` cannot exceed `inference.action_horizon`."
+                "`inference.n_action_steps` cannot exceed `data.sampling.action_horizon`."
             )
-        self.history_length = int(inference_cfg.get("history_length", 1))
+        self.history_length = int(data_sampling_cfg.get("observation_history_steps", 1))
         if self.history_length < 1:
-            raise ValueError("`inference.history_length` must be >= 1.")
+            raise ValueError("`data.sampling.observation_history_steps` must be >= 1.")
 
-        state_dim = int(inference_cfg.get("state_dim", self.action_dim))
+        state_dim = int(data_features_cfg.get("state_dim") or 0)
+        self.state_dim = state_dim
         input_features = {
             key: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224))
             for key in self.image_keys
@@ -230,34 +300,346 @@ class MolmoAct2(Model):
         policy_config = MolmoAct2Config(
             checkpoint_path=repo_id,
             checkpoint_revision=revision,
+            checkpoint_force_download=bool(checkpoint_cfg.get("force_download", False)),
+            n_obs_steps=self.history_length,
             chunk_size=self.action_horizon,
             n_action_steps=int(self.n_action_steps),
             action_mode=self.action_mode,
-            inference_action_mode=inference_cfg.get("action_mode", "continuous"),
+            inference_action_mode=inference_cfg.get("inference_action_mode", "continuous"),
             norm_tag=self.norm_tag,
+            setup_type=str(data_embodiment_cfg.get("setup_type", "")),
+            control_mode=str(data_embodiment_cfg.get("control_mode", "")),
             image_keys=self.image_keys,
+            normalize_language=bool(data_text_cfg.get("normalize_language", True)),
+            normalize_gripper=bool(data_embodiment_cfg.get("normalize_gripper", False)),
+            add_setup_tokens=bool(inference_cfg.get("add_setup_tokens", True)),
+            add_control_tokens=bool(inference_cfg.get("add_control_tokens", True)),
+            max_sequence_length=inference_cfg.get("max_sequence_length"),
             num_flow_timesteps=self.num_flow_matching_steps,
+            flow_matching_cutoff=float(training_cfg.get("flow_matching_cutoff", 1.0)),
+            flow_matching_time_offset=float(training_cfg.get("flow_matching_time_offset", 0.001)),
+            flow_matching_time_scale=float(training_cfg.get("flow_matching_time_scale", 0.999)),
+            flow_matching_beta_alpha=float(training_cfg.get("flow_matching_beta_alpha", 1.0)),
+            flow_matching_beta_beta=float(training_cfg.get("flow_matching_beta_beta", 1.5)),
+            mask_action_dim_padding=bool(training_cfg.get("mask_action_dim_padding", True)),
             expected_max_action_dim=int(model_cfg.get("max_action_dim", 32)),
             model_dtype=str(runtime_cfg.get("dtype", "bfloat16")),
             train_mode_vlm=training_cfg.get("train_mode_vlm", "lora"),
+            lora_rank=int(training_lora_cfg.get("rank", 64)),
+            lora_alpha=int(training_lora_cfg.get("alpha", 16)),
+            lora_dropout=float(training_lora_cfg.get("dropout", 0.05)),
+            lora_bias=str(training_lora_cfg.get("bias", "none")),
+            enable_knowledge_insulation=bool(training_cfg.get("enable_knowledge_insulation", False)),
+            freeze_embedding=bool(training_cfg.get("freeze_embedding", True)),
             gradient_checkpointing=bool(training_cfg.get("gradient_checkpointing", False)),
+            llm_residual_dropout=float(training_cfg.get("llm_residual_dropout", 0.1)),
+            optimizer_lr=float(
+                training_optimizer_cfg.get(
+                    "language_learning_rate",
+                    training_optimizer_cfg.get("learning_rate", 1.0e-5),
+                )
+            ),
+            optimizer_vit_lr=float(training_optimizer_cfg.get("vision_learning_rate", 5.0e-6)),
+            optimizer_connector_lr=float(training_optimizer_cfg.get("connector_learning_rate", 5.0e-6)),
+            optimizer_action_expert_lr=float(
+                training_optimizer_cfg.get("action_expert_learning_rate", 5.0e-5)
+            ),
+            optimizer_betas=tuple(training_optimizer_cfg.get("betas", [0.9, 0.95])),
+            optimizer_eps=float(training_optimizer_cfg.get("eps", 1.0e-6)),
+            optimizer_weight_decay=float(training_optimizer_cfg.get("weight_decay", 0.0)),
+            optimizer_grad_clip_norm=float(training_optimizer_cfg.get("grad_clip_norm", 1.0)),
+            scheduler_warmup_steps=int(training_scheduler_cfg.get("warmup_steps", 200)),
+            scheduler_decay_steps=training_scheduler_cfg.get("decay_steps"),
+            scheduler_decay_lr=float(training_scheduler_cfg.get("decay_learning_rate", 1.0e-6)),
+            normalization_mapping=normalization_mapping,
+            num_inference_steps=inference_cfg.get("num_inference_steps"),
+            enable_inference_cuda_graph=bool(inference_cfg.get("enable_inference_cuda_graph", False)),
+            per_episode_seed=bool(inference_cfg.get("per_episode_seed", False)),
+            eval_seed=inference_cfg.get("eval_seed"),
             input_features=input_features,
             output_features=output_features,
             device=str(self.device),
         )
         self.policy = MolmoAct2Policy(policy_config)
         self.policy.to(self.device)
+        self.preprocessor = None
+        self.postprocessor = None
+        self._configured_dataset_metadata: DatasetMetadata | None = None
+        self._configured_native_metadata: Any | None = None
+
+    @property
+    def preprocessor_handles_device(self) -> bool:
+        return True
+
+    def configure_dataset(
+        self,
+        metadata: DatasetMetadata,
+        *,
+        native_metadata: Any | None = None,
+    ) -> None:
+        """Build LeRobot's MolmoAct2 input pipeline using this dataset's stats."""
+        if (
+            self.preprocessor is not None
+            and self._configured_dataset_metadata is metadata
+            and self._configured_native_metadata is native_metadata
+        ):
+            return
+
+        action_feature = metadata.action_feature
+        if (
+            action_feature is not None
+            and action_feature.shape
+            and self.action_dim < action_feature.shape[-1]
+        ):
+            raise ValueError(
+                f"Configured action_dim={self.action_dim} is smaller than dataset "
+                f"action dimension {action_feature.shape[-1]}."
+            )
+        state_feature = metadata.state_feature
+        if (
+            state_feature is not None
+            and state_feature.shape
+            and self.state_dim != state_feature.shape[-1]
+        ):
+            raise ValueError(
+                f"Configured state_dim={self.state_dim} does not match dataset "
+                f"state dimension {state_feature.shape[-1]}; build the model with "
+                "dataset metadata so feature dimensions can be inferred."
+            )
+        missing_cameras = set(self.image_keys).difference(metadata.camera_keys)
+        if missing_cameras:
+            raise ValueError(
+                f"Configured image keys are missing from the dataset: {sorted(missing_cameras)}."
+            )
+
+        if metadata.stats is None and self.norm_tag is None:
+            normalization = getattr(self.policy.config, "normalization_mapping", {})
+            required_stats = {
+                "STATE": "observation.state",
+                "ACTION": "action",
+            }
+            for mode_key, feature_key in required_stats.items():
+                mode = normalization.get(mode_key)
+                mode_name = getattr(mode, "name", str(mode)).upper()
+                if mode_name not in {"IDENTITY", "NONE"}:
+                    raise ValueError(
+                        f"Dataset statistics for {feature_key!r} are required by the "
+                        "configured MolmoAct2 normalization."
+                    )
+
+        from lerobot.policies import make_pre_post_processors
+
+        self.preprocessor, self.postprocessor = make_pre_post_processors(
+            self.policy.config,
+            dataset_stats=metadata.stats,
+            dataset_meta=native_metadata,
+        )
+        self._configured_dataset_metadata = metadata
+        self._configured_native_metadata = native_metadata
 
     def preprocess_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
-        """Return a batch prepared for the official LeRobot policy.
+        """Use the official LeRobot pipeline to prepare a raw training batch."""
+        return self._preprocess_batch(batch, require_action=True)
 
-        Universal Open Badger data preprocessing owns conversion from raw
-        LeRobot observations to this tensor contract. The official policy then
-        owns image/token processing, action normalization, and padding masks.
-        """
+    def preprocess_observation_batch(self, batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Prepare observations for action prediction without a supervised target."""
+        return self._preprocess_batch(batch, require_action=False)
+
+    def _preprocess_batch(
+        self,
+        batch: Mapping[str, Any],
+        *,
+        require_action: bool,
+    ) -> Mapping[str, Any]:
         if not isinstance(batch, Mapping):
             raise TypeError("MolmoAct2 expects a mapping batch.")
-        return batch
+        if self.preprocessor is None:
+            raise RuntimeError(
+                "MolmoAct2 dataset preprocessing is not configured; call "
+                "configure_dataset() with the source dataset metadata first."
+            )
+        if self.history_length != 1:
+            raise NotImplementedError(
+                "MolmoAct2 frame history is not yet assembled by the universal data loader."
+            )
+
+        prepared = dict(batch)
+        state = prepared.get("observation.state")
+        if state is None:
+            raise KeyError("MolmoAct2 training batches require 'observation.state'.")
+        state_tensor = torch.as_tensor(state, dtype=torch.float32)
+        if state_tensor.ndim != 2 or state_tensor.shape[-1] != self.state_dim:
+            raise ValueError(
+                "Expected observation.state with shape "
+                f"[batch, {self.state_dim}], got {tuple(state_tensor.shape)}."
+            )
+        prepared["observation.state"] = state_tensor
+
+        action = prepared.get("action")
+        if action is None:
+            if require_action:
+                raise KeyError("MolmoAct2 training batches require an 'action' chunk.")
+            prepared.pop("action", None)
+        else:
+            action_tensor = torch.as_tensor(action, dtype=torch.float32)
+            if action_tensor.ndim != 3:
+                raise ValueError(
+                    "Expected action chunks with shape [batch, horizon, action_dim], "
+                    f"got {tuple(action_tensor.shape)}."
+                )
+            if action_tensor.shape[1] != self.action_horizon:
+                raise ValueError(
+                    f"Action horizon {action_tensor.shape[1]} does not match configured "
+                    f"horizon {self.action_horizon}."
+                )
+            if action_tensor.shape[2] > self.max_action_dim:
+                raise ValueError(
+                    f"Action dim {action_tensor.shape[2]} exceeds MolmoAct2 maximum "
+                    f"{self.max_action_dim}."
+                )
+            prepared["action"] = action_tensor
+
+        for image_key in self.image_keys:
+            image = prepared.get(image_key)
+            if not torch.is_tensor(image):
+                raise TypeError(f"Camera input {image_key!r} must be a tensor.")
+            if image.dtype == torch.uint8:
+                prepared[image_key] = image.to(dtype=torch.float32).div_(255.0)
+
+        processed = self.preprocessor(prepared)
+        if not isinstance(processed, Mapping):
+            raise TypeError("The official MolmoAct2 preprocessor must return a mapping.")
+        return processed
+
+    def predict_action_chunk_from_batch(
+        self,
+        batch: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        """Preprocess raw observations and predict an action chunk."""
+        inputs = self.preprocess_observation_batch(batch)
+        return self.forward(inputs, **kwargs)
+
+    def optimizer_parameter_groups(self) -> list[dict[str, Any]]:
+        """Use LeRobot's groups while honoring Open Badger's configured learning rates."""
+        optimizer_config = (
+            (self.config.get("finetuning", {}) or {}).get("optimizer", {}) or {}
+        )
+        # LeRobot calls the text-transformer bucket "VLM"; vision and connector
+        # parameters are classified into their own groups below.
+        learning_rates = {
+            "language_backbone": float(
+                optimizer_config.get(
+                    "language_learning_rate",
+                    optimizer_config.get("learning_rate", 1.0e-5),
+                )
+            ),
+            "vision": float(optimizer_config.get("vision_learning_rate", 5.0e-6)),
+            "connector": float(optimizer_config.get("connector_learning_rate", 5.0e-6)),
+            "action_expert": float(
+                optimizer_config.get("action_expert_learning_rate", 5.0e-5)
+            ),
+        }
+        parameter_categories: dict[int, str] = {}
+        for name, parameter in self.policy.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if "action_expert" in name:
+                category = "action_expert"
+            elif any(part in name for part in ("image_pooling_2d", "image_projector")):
+                category = "connector"
+            elif any(part in name for part in ("vision", "image_encoder", "vit")):
+                category = "vision"
+            elif any(part in name for part in ("multi_modal_projector", "connector", "mm_projector")):
+                category = "connector"
+            else:
+                category = "language_backbone"
+            parameter_categories[id(parameter)] = category
+
+        groups = self.policy.get_optim_params()
+        grouped_ids: list[int] = []
+        for group in groups:
+            parameters = group.get("params", ())
+            categories = {parameter_categories.get(id(parameter)) for parameter in parameters}
+            if None in categories or len(categories) != 1:
+                raise RuntimeError(
+                    "LeRobot optimizer groups do not align with the trainable MolmoAct2 "
+                    "parameter categories."
+                )
+            category = next(iter(categories))
+            group["lr"] = learning_rates[category]
+            grouped_ids.extend(id(parameter) for parameter in parameters)
+
+        if sorted(grouped_ids) != sorted(parameter_categories):
+            raise RuntimeError(
+                "LeRobot optimizer groups do not include each trainable MolmoAct2 parameter "
+                "exactly once."
+            )
+        return groups
+
+    def training_checkpoint_artifact(self) -> tuple[str, dict[str, torch.Tensor]]:
+        """Save trainable tensors for the selected method and target scope."""
+        finetuning = self.config.get("finetuning", {}) or {}
+        strategy = str(finetuning.get("selected_strategy", "lora"))
+        action_expert_only = bool(finetuning.get("action_expert_only", False))
+        if action_expert_only:
+            artifact_name = "action_expert.safetensors"
+        elif strategy == "lora":
+            artifact_name = "adapter_model.safetensors"
+        elif strategy == "full_finetune":
+            return "model.safetensors", dict(self.state_dict())
+        else:
+            raise ValueError(f"Unsupported MolmoAct2 training strategy: {strategy!r}.")
+
+        trainable_names = {
+            name for name, parameter in self.named_parameters() if parameter.requires_grad
+        }
+        state = self.state_dict()
+        tensors = {name: state[name] for name in trainable_names if name in state}
+        if set(tensors) != trainable_names:
+            missing = sorted(trainable_names.difference(tensors))
+            raise RuntimeError(
+                f"Trainable parameters are missing from the MolmoAct2 state dict: {missing}."
+            )
+        if not tensors:
+            raise RuntimeError(f"MolmoAct2 strategy {strategy!r} has no trainable tensors.")
+        return artifact_name, tensors
+
+    def load_training_checkpoint_artifact(
+        self,
+        artifact_name: str,
+        tensors: Mapping[str, torch.Tensor],
+    ) -> None:
+        expected_name, _ = self.training_checkpoint_artifact()
+        if artifact_name != expected_name:
+            raise ValueError(
+                f"Checkpoint artifact {artifact_name!r} does not match the selected "
+                f"strategy; expected {expected_name!r}."
+            )
+        finetuning = self.config.get("finetuning", {}) or {}
+        strategy = str(finetuning.get("selected_strategy", "lora"))
+        action_expert_only = bool(finetuning.get("action_expert_only", False))
+        if not action_expert_only and strategy == "full_finetune":
+            self.load_state_dict(dict(tensors), strict=True)
+            return
+
+        if strategy not in {"lora", "full_finetune"}:
+            raise ValueError(f"Unsupported MolmoAct2 training strategy: {strategy!r}.")
+        expected_names = {
+            name for name, parameter in self.named_parameters() if parameter.requires_grad
+        }
+        if set(tensors) != expected_names:
+            missing = sorted(expected_names.difference(tensors))
+            unexpected = sorted(set(tensors).difference(expected_names))
+            raise ValueError(
+                "Checkpoint trainable parameter set does not match this model "
+                f"(missing={missing}, unexpected={unexpected})."
+            )
+        incompatible = self.load_state_dict(dict(tensors), strict=False)
+        if incompatible.unexpected_keys:
+            raise ValueError(
+                f"Checkpoint contains unexpected model tensors: {incompatible.unexpected_keys}."
+            )
 
     def forward(self, inputs: Mapping[str, Any], **kwargs: Any) -> torch.Tensor:
         """Delegate inference-time action generation to the official policy."""

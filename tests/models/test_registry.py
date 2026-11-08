@@ -52,6 +52,22 @@ def test_model_training_step_runs_default_pipeline():
     assert torch.is_tensor(result["loss"])
 
 
+def test_model_default_optimizer_groups_contain_trainable_parameters():
+    model = RegisteredDummyModel({"device": "cpu", "dtype": "float32"})
+    model.linear.bias.requires_grad_(False)
+
+    groups = model.optimizer_parameter_groups()
+
+    assert groups == [{"params": [model.linear.weight]}]
+
+
+def test_model_action_prediction_hook_is_optional_for_non_vla_models():
+    model = RegisteredDummyModel({"device": "cpu", "dtype": "float32"})
+
+    with pytest.raises(NotImplementedError, match="does not implement VLA"):
+        model.predict_action_chunk_from_batch(torch.randn(1, 2))
+
+
 def test_model_requires_preprocess_and_loss_hooks():
     class IncompleteModel(Model):
         def build_network(self) -> None:

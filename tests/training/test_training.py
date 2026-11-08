@@ -1,0 +1,482 @@
+import random
+from pathlib import Path
+
+import pytest
+import torch
+
+from open_badger.data.schema import (
+    DatasetMetadata,
+    FeatureMetadata,
+    SamplePointer,
+    TrainingExampleRef,
+)
+from open_badger.training.training import (
+    build_optimizer,
+    build_training_dataloader,
+    load_training_config,
+    seed_training,
+    train,
+    train_from_manifest,
+)
+from open_badger.training.checkpointing import TrainingCheckpointManager
+from scripts.train import _apply_gradient_checkpointing_override, _build_parser
+
+
+class ToyModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(0.0))
+        self.device = torch.device("cpu")
+
+    def training_step(self, batch):
+        loss = (self.weight * batch["input"] - batch["target"]).square().mean()
+        return {"loss": loss, "metrics": {"train_loss": loss.detach()}}
+
+
+class FakeReader:
+    def __init__(self):
+        self.dataset_metadata = DatasetMetadata(
+            dataset_id="demo/dataset",
+            revision="rev-1",
+            format_version="v3",
+            fps=10.0,
+            total_frames=2,
+            total_episodes=1,
+            features={
+                "observation.state": FeatureMetadata(
+                    "observation.state", "state", (2,), "float32"
+                ),
+                "action": FeatureMetadata("action", "action", (2,), "float32"),
+            },
+            episode_lengths={0: 2},
+        )
+
+    def metadata(self):
+        return self.dataset_metadata
+
+    def get_frame(self, pointer):
+        return {"observation.state": [0.0, 1.0]}
+
+    def get_feature(self, pointer, feature_name, *, frame_offset=0):
+        return [float(frame_offset), 2.0]
+
+
+def test_train_runs_optimizer_steps_with_gradient_accumulation():
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    batches = [
+        {"input": torch.tensor([1.0]), "target": torch.tensor([1.0])},
+        {"input": torch.tensor([2.0]), "target": torch.tensor([2.0])},
+    ]
+
+    result = train(
+        model,
+        batches,
+        optimizer,
+        max_steps=2,
+        gradient_accumulation_steps=2,
+    )
+
+    assert result.steps == 2
+    assert result.loss >= 0
+    assert result.metrics["train_loss"] >= 0
+    assert model.weight.item() > 0
+
+
+def test_seed_training_repeats_python_and_torch_randomness():
+    seed_training(42)
+    expected = (torch.rand(1), random.random())
+
+    seed_training(42)
+    actual = (torch.rand(1), random.random())
+
+    assert torch.equal(expected[0], actual[0])
+    assert expected[1] == actual[1]
+
+
+def test_train_logs_metrics_on_interval_and_final_step():
+    class RecordingLogger:
+        def __init__(self):
+            self.events = []
+
+        def log_metrics(self, metrics, *, step):
+            self.events.append((step, dict(metrics)))
+
+        def close(self):
+            pass
+
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    logger = RecordingLogger()
+
+    train(
+        model,
+        [{"input": torch.tensor([1.0]), "target": torch.tensor([1.0])}],
+        optimizer,
+        max_steps=3,
+        log_every_steps=2,
+        metric_logger=logger,
+    )
+
+    assert [step for step, _ in logger.events] == [2, 3]
+    assert all("train/loss" in metrics for _, metrics in logger.events)
+    assert all("train/update_time_seconds" in metrics for _, metrics in logger.events)
+    assert all("train/train_loss" in metrics for _, metrics in logger.events)
+
+
+def test_train_resumes_from_checkpoint_and_saves_final_update(tmp_path):
+    model = ToyModel()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+    manager = TrainingCheckpointManager(
+        tmp_path / "run",
+        keep_last_n=2,
+        identity={"strategy": "lora", "dataset_id": "demo/data"},
+    )
+    batches = [{"input": torch.tensor([1.0]), "target": torch.tensor([1.0])}]
+    train(
+        model,
+        batches,
+        optimizer,
+        max_steps=2,
+        checkpoint_every_steps=2,
+        checkpoint_callback=lambda step: manager.save(model, optimizer, step=step),
+    )
+
+    resumed_model = ToyModel()
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), lr=0.1)
+    start_step = manager.load("latest", resumed_model, resumed_optimizer)
+    assert start_step == 2
+    assert resumed_model.weight.item() == pytest.approx(model.weight.item())
+    assert resumed_optimizer.state_dict()["state"]
+
+    result = train(
+        resumed_model,
+        batches,
+        resumed_optimizer,
+        max_steps=3,
+        start_step=start_step,
+        checkpoint_every_steps=2,
+        checkpoint_callback=lambda step: manager.save(
+            resumed_model, resumed_optimizer, step=step
+        ),
+    )
+
+    assert result.steps == 3
+    assert (tmp_path / "run" / "checkpoint-00000003" / "model.safetensors").is_file()
+
+
+def test_resumed_training_continues_at_saved_batch_offset():
+    class RecordingModel(ToyModel):
+        def __init__(self):
+            super().__init__()
+            self.seen_targets = []
+
+        def training_step(self, batch):
+            self.seen_targets.append(float(batch["target"].item()))
+            return super().training_step(batch)
+
+    model = RecordingModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    batches = [
+        {"input": torch.tensor([1.0]), "target": torch.tensor([1.0])},
+        {"input": torch.tensor([2.0]), "target": torch.tensor([2.0])},
+    ]
+
+    train(model, batches, optimizer, max_steps=2, start_step=1)
+
+    assert model.seen_targets == [2.0]
+
+
+def test_train_saves_checkpoint_on_final_update_before_interval():
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    saved_steps = []
+
+    train(
+        model,
+        [{"input": torch.tensor([1.0]), "target": torch.tensor([1.0])}],
+        optimizer,
+        max_steps=1,
+        checkpoint_every_steps=1000,
+        checkpoint_callback=saved_steps.append,
+    )
+
+    assert saved_steps == [1]
+
+
+def test_train_rejects_empty_batches():
+    model = ToyModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    try:
+        train(model, [], optimizer, max_steps=1)
+    except ValueError as exc:
+        assert "empty batch iterable" in str(exc)
+    else:
+        raise AssertionError("Expected an empty iterable to be rejected.")
+
+
+def test_build_training_dataloader_resolves_manifest_and_batches():
+    reader = FakeReader()
+    pointer = SamplePointer(
+        "demo/dataset",
+        "rev-1",
+        0,
+        0,
+        0,
+        0.0,
+        10.0,
+        dataset_index=0,
+    )
+    example = TrainingExampleRef(
+        sample=pointer,
+        action_horizon=2,
+        action_frame_offsets=(0, 1),
+        task="pick",
+        action_dim=2,
+        state_dim=2,
+    )
+    loader = build_training_dataloader(
+        reader,
+        [example],
+        {
+            "sampling": {"shuffle": False},
+            "loader": {
+                "batch_size": 1,
+                "num_workers": 0,
+                "persistent_workers": False,
+            },
+        },
+    )
+
+    batch = next(iter(loader))
+
+    assert batch["observation.state"].shape == (1, 2)
+    assert batch["action"].shape == (1, 2, 2)
+
+
+def test_build_training_dataloader_caps_workers_to_available_examples():
+    reader = FakeReader()
+    example = TrainingExampleRef(
+        sample=SamplePointer(
+            "demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0, dataset_index=0
+        ),
+        action_horizon=1,
+        action_frame_offsets=(0,),
+        action_dim=2,
+        state_dim=2,
+    )
+
+    with pytest.warns(UserWarning, match="fewer independent work shards"):
+        loader = build_training_dataloader(
+            reader,
+            [example],
+            {
+                "sampling": {"shuffle": False},
+                "loader": {
+                    "batch_size": 1,
+                    "num_workers": 4,
+                    "persistent_workers": False,
+                },
+            },
+        )
+
+    assert loader.num_workers == 1
+
+
+def test_build_training_dataloader_serializes_unsplittable_iterables():
+    class SizedIterable:
+        def __init__(self, examples):
+            self.examples = examples
+
+        def __len__(self):
+            return len(self.examples)
+
+        def __iter__(self):
+            return iter(self.examples)
+
+    reader = FakeReader()
+    example = TrainingExampleRef(
+        sample=SamplePointer(
+            "demo/dataset", "rev-1", 0, 0, 0, 0.0, 10.0, dataset_index=0
+        ),
+        action_horizon=1,
+        action_frame_offsets=(0,),
+        action_dim=2,
+        state_dim=2,
+    )
+    with pytest.warns(UserWarning, match="fewer independent work shards"):
+        loader = build_training_dataloader(
+            reader,
+            SizedIterable([example]),
+            {
+                "sampling": {"shuffle": False},
+                "loader": {
+                    "batch_size": 1,
+                    "num_workers": 4,
+                    "persistent_workers": False,
+                },
+            },
+        )
+
+    assert loader.num_workers == 1
+
+
+def test_train_from_manifest_passes_resolved_action_chunk_to_model():
+    class ChunkModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.0))
+            self.device = torch.device("cpu")
+            self.action_shape = None
+
+        def training_step(self, batch):
+            self.action_shape = batch["action"].shape
+            loss = (batch["action"] * self.scale).square().mean()
+            return {"loss": loss}
+
+    reader = FakeReader()
+    example = TrainingExampleRef(
+        sample=SamplePointer(
+            "demo/dataset",
+            "rev-1",
+            0,
+            0,
+            0,
+            0.0,
+            10.0,
+            dataset_index=0,
+        ),
+        action_horizon=2,
+        action_frame_offsets=(0, 1),
+        action_dim=2,
+        state_dim=2,
+    )
+    model = ChunkModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+    class RecordingLogger:
+        events = []
+
+        def log_metrics(self, metrics, *, step):
+            self.events.append((step, dict(metrics)))
+
+        def close(self):
+            pass
+
+    logger = RecordingLogger()
+    result = train_from_manifest(
+        model,
+        reader,
+        [example],
+        optimizer,
+        data_config={
+            "sampling": {"shuffle": False},
+            "loader": {
+                "batch_size": 1,
+                "num_workers": 0,
+                "persistent_workers": False,
+            },
+        },
+        max_steps=1,
+        log_every_steps=1,
+        metric_logger=logger,
+    )
+
+    assert result.steps == 1
+    assert model.action_shape == (1, 2, 2)
+    assert logger.events[0][0] == 1
+    assert "train/loss" in logger.events[0][1]
+
+
+def test_load_training_config_composes_referenced_model_and_data_configs():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    model_config, data_config = load_training_config(
+        repository_root / "configs/training/train.yaml"
+    )
+
+    assert model_config["model"]["name"] == "molmoact2"
+    assert model_config["finetuning"]["selected_strategy"] == "lora"
+    assert model_config["data"]["sampling"]["action_horizon"] == 10
+    assert model_config["training"]["logging"]["every_steps"] == 10
+    assert model_config["training"]["logging"]["tensorboard"]["enabled"] is False
+    assert data_config["manifest"]["rebuild"] is False
+
+
+def test_load_training_config_supports_strategy_override():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    model_config, _ = load_training_config(
+        repository_root / "configs/training/train.yaml",
+        strategy="full_finetune",
+    )
+
+    assert model_config["finetuning"]["selected_strategy"] == "full_finetune"
+    assert model_config["finetuning"]["action_expert_only"] is False
+
+
+def test_action_expert_only_is_not_a_finetuning_strategy():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(ValueError, match="Unknown fine-tuning strategy"):
+        load_training_config(
+            repository_root / "configs/training/train.yaml",
+            strategy="action_expert_only",
+        )
+
+
+def test_action_expert_only_is_independent_of_full_finetune_method():
+    repository_root = Path(__file__).resolve().parents[2]
+
+    model_config, _ = load_training_config(
+        repository_root / "configs/training/train.yaml",
+        strategy="full_finetune",
+    )
+
+    model_config["finetuning"]["action_expert_only"] = True
+    assert model_config["finetuning"]["selected_strategy"] == "full_finetune"
+    assert model_config["finetuning"]["action_expert_only"] is True
+
+
+def test_gradient_checkpointing_cli_override_targets_selected_strategy():
+    model_config, _ = load_training_config(
+        Path(__file__).resolve().parents[2] / "configs/training/train.yaml",
+        strategy="lora",
+    )
+
+    _apply_gradient_checkpointing_override(model_config, True)
+
+    assert model_config["finetuning"]["strategies"]["lora"]["gradient_checkpointing"] is True
+    assert model_config["finetuning"]["strategies"]["full_finetune"]["gradient_checkpointing"] is True
+
+
+def test_gradient_checkpointing_cli_flag_supports_on_and_off():
+    parser = _build_parser()
+
+    assert parser.parse_args(["--gradient-checkpointing"]).gradient_checkpointing is True
+    assert parser.parse_args(["--no-gradient-checkpointing"]).gradient_checkpointing is False
+
+
+def test_build_optimizer_uses_model_parameter_groups():
+    model = ToyModel()
+    model.policy = object()
+    model.optimizer_parameter_groups = lambda: [{"params": [model.weight], "lr": 0.03}]
+
+    optimizer = build_optimizer(
+        model,
+        {
+            "finetuning": {
+                "optimizer": {
+                    "learning_rate": 0.1,
+                    "betas": [0.8, 0.9],
+                    "eps": 1e-6,
+                    "weight_decay": 0.01,
+                }
+            }
+        },
+    )
+
+    assert optimizer.param_groups[0]["lr"] == 0.03
+    assert optimizer.defaults["lr"] == 0.1
+    assert optimizer.defaults["betas"] == (0.8, 0.9)

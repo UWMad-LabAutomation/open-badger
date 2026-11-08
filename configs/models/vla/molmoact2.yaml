@@ -8,8 +8,7 @@ model:
     source: huggingface
     repo_id: allenai/MolmoAct2
     revision: null
-    cache_dir: null
-    local_files_only: false
+    force_download: false
 
 runtime:
   device: cuda:0
@@ -18,29 +17,80 @@ runtime:
   dtype: bfloat16
 
 training:
-  # Delegated to the official LeRobot MolmoAct2 policy.
+  max_steps: 50000
+  gradient_accumulation_steps: 1
+  mixed_precision: bf16
+  seed: 42
+
+  checkpointing:
+    directory: outputs/checkpoints
+    save_every_steps: 1000
+    keep_last_n: 3
+    resume_from: null
+
+  validation:
+    every_steps: 500
+
+finetuning:
+  # The active strategy is selected by the high-level training config.
+  # Shared by every fine-tuning strategy.
   action_mode: continuous
-  train_mode_vlm: lora
-  gradient_checkpointing: false
   flow_matching_steps: 8
+  flow_matching_cutoff: 1.0
+  flow_matching_time_offset: 0.001
+  flow_matching_time_scale: 0.999
+  flow_matching_beta_alpha: 1.0
+  flow_matching_beta_beta: 1.5
+  mask_action_dim_padding: true
+  enable_knowledge_insulation: false
+  freeze_embedding: true
+  llm_residual_dropout: 0.1
+
+  lora:
+    rank: 64
+    alpha: 16
+    dropout: 0.05
+    bias: none
+
+  # Only targets action-expert flow-matching layers.
+  action_expert_only: false
+
+  optimizer:
+    language_learning_rate: 1.0e-5
+    vision_learning_rate: 5.0e-6
+    connector_learning_rate: 5.0e-6
+    action_expert_learning_rate: 5.0e-5
+    betas: [0.9, 0.95]
+    eps: 1.0e-6
+    weight_decay: 0.0
+    grad_clip_norm: 1.0
+
+  scheduler:
+    warmup_steps: 200
+    decay_steps: null
+    decay_learning_rate: 1.0e-6
+
+  # Strategies only override behavior that genuinely differs.
+  strategies:
+    lora:
+      train_mode_vlm: lora
+      gradient_checkpointing: false
+
+    full_finetune:
+      train_mode_vlm: fft
+      gradient_checkpointing: true
 
 inference:
-  action_mode: continuous
+  inference_action_mode: continuous
   norm_tag: null
-  sequence_length: null
-  # Number of future control timesteps predicted per policy query.
-  action_horizon: 10
-  # Number of predicted actions consumed before querying the policy again.
   n_action_steps: 10
-  # Internal flow integration steps; this is not the action horizon.
-  flow_matching_steps: 8
-  # Ordered universal observation.images.* keys (renamed from raw dataset
-  # camera names by the data-loading layer), not per-robot names like top/cam0.
-  image_keys: []
-  action_dim: 32    # molmoact2 outputs actions and a 32D continuous action space
-  # 1 = Markovian (current frame only). >1 stacks that many past frames per
-  # observation key for benchmarking framestacked vs Markovian policies.
-  history_length: 1
+  num_inference_steps: null
+  add_setup_tokens: true
+  add_control_tokens: true
+  max_sequence_length: null
+  enable_inference_cuda_graph: false
+  per_episode_seed: false
+  eval_seed: null
 
 optimization:
   attention: sdpa

@@ -12,6 +12,7 @@ version = "0.1.0"
 description = "Research framework for robot policy training and inference"
 requires-python = ">=3.11,<3.13"
 dependencies = [
+    "pyarrow>=15.0",
     "PyYAML>=6.0",
 ]
 
