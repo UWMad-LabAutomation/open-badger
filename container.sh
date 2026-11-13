@@ -41,13 +41,21 @@ case "$command" in
         fi
 
         mkdir -p "$ROOT_DIR/.cache/huggingface"
+        camera_devices=()
+        for device in /dev/video*; do
+            [[ -e "$device" ]] || continue
+            camera_devices+=(--device "$device:$device")
+        done
+
         docker run --rm -it \
             --name "$CONTAINER_NAME" \
+            --network host \
             --runtime=nvidia \
             -e NVIDIA_VISIBLE_DEVICES=all \
             -e HF_HOME=/workspace/open-badger/.cache/huggingface \
             -e WANDB_API_KEY \
             -e WANDB_DIR=/workspace/open-badger/outputs/wandb \
+            "${camera_devices[@]}" \
             --volume "$ROOT_DIR:/workspace/open-badger" \
             --workdir /workspace/open-badger \
             "$IMAGE_NAME" \
