@@ -11,10 +11,11 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="${OPEN_BADGER_IMAGE:-open-badger:dev}"
 CONTAINER_NAME="${OPEN_BADGER_CONTAINER:-open-badger-dev}"
+BUILD_PLATFORM="${OPEN_BADGER_PLATFORM:-}"
 
 usage() {
     echo "Usage: $0 {build|run} [command...]" >&2
-    echo "Environment: OPEN_BADGER_IMAGE, OPEN_BADGER_CONTAINER" >&2
+    echo "Environment: OPEN_BADGER_IMAGE, OPEN_BADGER_CONTAINER, OPEN_BADGER_PLATFORM" >&2
 }
 
 if [[ $# -lt 1 ]]; then
@@ -29,10 +30,14 @@ case "$command" in
     build)
         # Build the image from the repository root so Docker can access the
         # package metadata, source tree, configs, and scripts.
-        docker build \
-            --file "$ROOT_DIR/tools/docker/Dockerfile" \
-            --tag "$IMAGE_NAME" \
-            "$ROOT_DIR"
+        build_args=(
+            --file "$ROOT_DIR/tools/docker/Dockerfile"
+            --tag "$IMAGE_NAME"
+        )
+        if [[ -n "$BUILD_PLATFORM" ]]; then
+            build_args+=(--platform "$BUILD_PLATFORM")
+        fi
+        docker build "${build_args[@]}" "$ROOT_DIR"
         ;;
 
     run)

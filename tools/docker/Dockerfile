@@ -12,6 +12,7 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 ARG LEROBOT_COMMIT=a4f15bf347dee7eb8a8c5f4a70a37f476b091113
 ENV LEROBOT_ROOT=/opt/lerobot
+ENV YAM_ABC_ROOT=/opt/yam-abc-reproduce
 
 WORKDIR /workspace/open-badger
 
@@ -20,14 +21,32 @@ WORKDIR /workspace/open-badger
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        build-essential \
         git \
         python3 \
+        python3-dev \
         python3-pip \
         python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # Keep project packages out of Ubuntu's externally managed system Python.
 RUN python3 -m venv "$VIRTUAL_ENV"
+
+# Keep the YAM GUI/runtime source available at the same commit used by the
+# collection launcher. Its Python environment remains separate from training.
+COPY third_party/yam-abc-reproduce.lock.json /tmp/yam-abc-reproduce.lock.json
+RUN YAM_REPOSITORY="$(python3 -c 'import json; print(json.load(open("/tmp/yam-abc-reproduce.lock.json"))["repository"])')" \
+    && YAM_COMMIT="$(python3 -c 'import json; print(json.load(open("/tmp/yam-abc-reproduce.lock.json"))["commit"])')" \
+    && YAM_I2RT_COMMIT="$(python3 -c 'import json; print(json.load(open("/tmp/yam-abc-reproduce.lock.json"))["i2rt_commit"])')" \
+    && git clone --no-checkout "$YAM_REPOSITORY" "$YAM_ABC_ROOT" \
+    && git -C "$YAM_ABC_ROOT" checkout --detach "$YAM_COMMIT" \
+    && git -C "$YAM_ABC_ROOT" -c submodule.third_party/i2rt.url=https://github.com/i2rt-robotics/i2rt.git \
+        submodule update --init third_party/i2rt \
+    && test "$(git -C "$YAM_ABC_ROOT" rev-parse HEAD)" = "$YAM_COMMIT" \
+    && test "$(git -C "$YAM_ABC_ROOT/third_party/i2rt" rev-parse HEAD)" = "$YAM_I2RT_COMMIT" \
+    && python3 -m pip install uv \
+    && uv sync --project "$YAM_ABC_ROOT" --frozen --python 3.12 --no-default-groups \
+        --extra camera --extra gui --extra lerobot --extra deploy
 
 # Install the upstream LeRobot MolmoAct2 policy at a pinned commit. Open
 # Badger adapts to this policy; it does not duplicate its model implementation.
@@ -55,7 +74,6 @@ RUN python3 -m pip install --upgrade pip setuptools \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
-        python3.12-dev \
     && rm -rf /var/lib/apt/lists/*
 
 CMD ["bash"]
